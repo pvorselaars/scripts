@@ -1,0 +1,5 @@
+#!/bin/sh
+
+pkill -f 'entr compiler' && exit
+echo "Autocompiling $1\n"
+echo $1 | entr compiler $1
