@@ -17,6 +17,8 @@ shebang() {
 case $file in 
 	*\.dot) dot -Tpng -O $file && dot -Tsvg -O $file ;;
 	*\.ms) groff $file -pejR -ms -Tpdf > $base.pdf ;;
+	*\.me) groff $file -pejR -me -Tpdf > $base.pdf ;;
+	*\.mom) groff $file -pejR -mom -Tpdf > $base.pdf ;;
 	*\.c) cc -Wall $file -o $base && $base ;;
 	*\.cpp) g++ -Wall $file -o $base && $base ;;
 	*\.rs) rustc $file -o $base && $base ;;
