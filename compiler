@@ -18,5 +18,6 @@ case $file in
 	*\.dot) dot -Tpng -O $file && dot -Tsvg -O $file ;;
 	*\.ms) groff $file -pejR -ms -Tpdf > $base.pdf ;;
 	*\.c) cc -Wall $file -o $base && $base ;;
+	*\.cpp) g++ -Wall $file -o $base && $base ;;
 	*) shebang ;;
 esac
