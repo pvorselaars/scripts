@@ -19,5 +19,6 @@ case $file in
 	*\.ms) groff $file -pejR -ms -Tpdf > $base.pdf ;;
 	*\.c) cc -Wall $file -o $base && $base ;;
 	*\.cpp) g++ -Wall $file -o $base && $base ;;
+	*\.rs) rustc $file -o $base && $base ;;
 	*) shebang ;;
 esac
