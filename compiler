@@ -24,5 +24,6 @@ case $file in
 	*\.rs) rustc $file -o $base && $base ;;
 	*\.m) octave $file ;;
 	*\.R) R --vanilla < $file ;;
+	*\.ps1) pwsh -nologo -file $file ;;
 	*) shebang ;;
 esac
