@@ -23,5 +23,6 @@ case $file in
 	*\.cpp) g++ -Wall $file -o $base && $base ;;
 	*\.rs) rustc $file -o $base && $base ;;
 	*\.m) octave $file ;;
+	*\.R) R --vanilla < $file ;;
 	*) shebang ;;
 esac
