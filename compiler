@@ -22,5 +22,6 @@ case $file in
 	*\.c) cc -Wall $file -o $base && $base ;;
 	*\.cpp) g++ -Wall $file -o $base && $base ;;
 	*\.rs) rustc $file -o $base && $base ;;
+	*\.m) octave $file ;;
 	*) shebang ;;
 esac
