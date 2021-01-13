@@ -25,5 +25,6 @@ case $file in
 	*\.m) octave $file ;;
 	*\.R) R --vanilla < $file ;;
 	*\.ps1) pwsh -nologo -file $file ;;
+	*\.pic) pic $file >> $base.ps ;;
 	*) shebang ;;
 esac
