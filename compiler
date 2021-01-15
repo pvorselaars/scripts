@@ -25,6 +25,7 @@ case $file in
 	*\.m) octave $file ;;
 	*\.R) R --vanilla < $file ;;
 	*\.ps1) pwsh -nologo -file $file ;;
-	*\.pic) pic $file >> $base.ps ;;
+	*\.pic) pic $file > $base.ps ;;
+	*\.sql) mysql < $file > $base.tab ;;
 	*) shebang ;;
 esac
