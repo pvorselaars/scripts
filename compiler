@@ -27,5 +27,6 @@ case $file in
 	*\.ps1) pwsh -nologo -file $file ;;
 	*\.pic) pic $file > $base.ps ;;
 	*\.sql) mysql < $file > $base.tab ;;
+	*\.s) as $file -o $base.o && ld $base.o -o $base && $base ;;
 	*) shebang ;;
 esac
