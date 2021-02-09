@@ -28,5 +28,6 @@ case $file in
 	*\.pic) pic $file > $base.ps ;;
 	*\.sql) mysql < $file > $base.tab ;;
 	*\.s) as $file -o $base.o && ld $base.o -o $base && $base ;;
+	*\.asm) nasm -f elf32 -o $base.o $file && ld -m elf_i386 -o $base $base.o && $base ;;
 	*) shebang ;;
 esac
