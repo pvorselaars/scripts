@@ -29,5 +29,6 @@ case $file in
 	*\.sql) mysql < $file > $base.tab ;;
 	*\.s) as $file -o $base.o && ld $base.o -o $base && $base ;;
 	*\.asm) nasm -f elf32 -o $base.o $file && ld -m elf_i386 -o $base $base.o && $base ;;
+	*\.tf) terraform validate -no-color && terraform plan -no-color -out=$base.tfplan ;;
 	*) shebang ;;
 esac
