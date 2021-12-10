@@ -1,8 +1,9 @@
 #!/bin/sh
 while true
 do
-
-	xsetroot -name "$(date '+%A, %d %b %R')"
+  DATE=$(date '+%A, %d %B %R')
+	BATTERY=$(cat /sys/class/power_supply/BAT0/capacity)
+	xsetroot -name "$BATTERY% $DATE" 
 	sleep 1m
 
 done &
