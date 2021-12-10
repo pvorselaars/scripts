@@ -3,7 +3,7 @@
 file=$(readlink -f $1)
 dir=$(dirname $file)
 base=${file%.*}
-shebang=$(sed -n 1p $file)
+shebang=$(head -n 1 $file)
 
 cd $dir || exit
 
@@ -19,7 +19,7 @@ case $file in
 	*\.ms) groff $file -pejR -ms -Tpdf > $base.pdf ;;
 	*\.me) groff $file -pejR -me -Tpdf > $base.pdf ;;
 	*\.mom) groff $file -pejR -mom -Tpdf > $base.pdf ;;
-	*\.c) cc -Wall $file -o $base && $base ;;
+	*\.c) cc -Wall -O -pedantic -ansi $file -o $base && $base ;;
 	*\.cpp) g++ -Wall $file -o $base && $base ;;
 	*\.rs) rustc $file -o $base && $base ;;
 	*\.m) octave $file ;;
