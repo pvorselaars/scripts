@@ -26,6 +26,7 @@ case $file in
 	*\.R) R --vanilla < $file ;;
 	*\.ps1) pwsh -nologo -file $file ;;
 	*\.pic) pic $file > $base.ps ;;
+	*\.py) python3 $file ;;
 	*\.sql) mysql < $file > $base.tab ;;
 	*\.s) as $file -o $base.o && ld $base.o -o $base && $base ;;
 	*\.asm) nasm -f elf32 -o $base.o $file && ld -m elf_i386 -o $base $base.o && $base ;;
