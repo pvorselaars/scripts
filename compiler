@@ -24,7 +24,7 @@ case $file in
 	*\.mom) groff $file -pejR -mom -Tpdf > $base.pdf ;;
 	*\.ms) groff $file -pejR -ms -Tpdf > $base.pdf ;;
 	*\.pic) pic $file > $base.ps ;;
-	*\.ps1) pwsh -nologo -file $file ;;
+	*\.ps1) pwsh -nologo -noexit -file $file ;;
 	*\.py) ipython3 --no-banner -i $file ;;
 	*\.R) R --vanilla < $file ;;
 	*\.rs) rustc $file -o $base && $base ;;
