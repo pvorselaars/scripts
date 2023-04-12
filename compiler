@@ -15,21 +15,22 @@ shebang() {
 }
 
 case $file in 
-	*\.dot) dot -Tpng -O $file && dot -Tsvg -O $file ;;
-	*\.ms) groff $file -pejR -ms -Tpdf > $base.pdf ;;
-	*\.me) groff $file -pejR -me -Tpdf > $base.pdf ;;
-	*\.mom) groff $file -pejR -mom -Tpdf > $base.pdf ;;
+	*\.asm) nasm -f elf32 -o $base.o $file && ld -m elf_i386 -o $base $base.o && $base ;;
 	*\.c) cc -Wall -O -pedantic -ansi $file -o $base && $base ;;
 	*\.cpp) g++ -Wall $file -o $base && $base ;;
-	*\.rs) rustc $file -o $base && $base ;;
+	*\.dot) dot -Tpng -O $file && dot -Tsvg -O $file ;;
 	*\.m) octave $file ;;
-	*\.R) R --vanilla < $file ;;
-	*\.ps1) pwsh -nologo -file $file ;;
+	*\.me) groff $file -pejR -me -Tpdf > $base.pdf ;;
+	*\.mom) groff $file -pejR -mom -Tpdf > $base.pdf ;;
+	*\.ms) groff $file -pejR -ms -Tpdf > $base.pdf ;;
 	*\.pic) pic $file > $base.ps ;;
+	*\.ps1) pwsh -nologo -file $file ;;
 	*\.py) python3 $file ;;
+	*\.R) R --vanilla < $file ;;
+	*\.rs) rustc $file -o $base && $base ;;
 	*\.sql) mysql < $file > $base.tab ;;
 	*\.s) as $file -o $base.o && ld $base.o -o $base && $base ;;
-	*\.asm) nasm -f elf32 -o $base.o $file && ld -m elf_i386 -o $base $base.o && $base ;;
 	*\.tf) terraform validate -no-color && terraform plan -no-color -out=$base.tfplan ;;
+	*\.tex) pdflatex $file ;;
 	*) shebang ;;
 esac
