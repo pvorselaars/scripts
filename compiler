@@ -24,9 +24,11 @@ shebang() {
 	esac	
 }
 
+shift 1
+
 case $file in 
 	*\.asm) nasm -f elf32 -o $base.o $file && ld -m elf_i386 -o $base $base.o && $base ;;
-	*\.c) cc -Wall -g -O -pedantic -std=c2x $file -o $base && $base ;;
+	*\.c) cc -Wall -g -O -pedantic -std=c2x $file -o $base && $base $@ ;;
 	*\.cpp) g++ -Wall $file -o $base && $base ;;
 	*\.dot) dot -Tpng -O $file && dot -Tsvg -O $file ;;
 	*\.m) octave -q --persist $file ;;
