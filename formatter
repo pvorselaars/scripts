@@ -17,6 +17,6 @@ base=${file%.*}
 cd $dir || exit 1
 
 case $file in 
-	*\.c) indent -linux -sob $@ ;;
+	*\.c) VERSION_CONTROL=none indent -linux -sob -l120 -lc120 $@ ;;
 	*) echo "No formatter configured for $1" && exit 1 ;;
 esac
