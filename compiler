@@ -30,6 +30,7 @@ case $file in
 	*\.asm) nasm -f elf32 -o $base.o $file && ld -m elf_i386 -o $base $base.o && $base ;;
 	*\.c) cc -Wall -g -O0 -pedantic -std=c2x $file -o $base && $base $@ ;;
 	*\.cpp) g++ -Wall $file -o $base && $base ;;
+	*\.cs) dotnet run $file ;;
 	*\.dot) dot -Tpng -O $file && dot -Tsvg -O $file ;;
 	*\.m) octave -q --persist $file ;;
 	*\.me) groff $file -pejR -me -Tpdf > $base.pdf ;;
