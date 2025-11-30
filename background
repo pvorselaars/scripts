@@ -2,12 +2,7 @@
 
 while true
 do
-	background=$(ls ~/Pictures/wallpapers/4K/* | shuf -n 1)
-	if echo $XDG_CURRENT_DESKTOP | grep "GNOME" > /dev/null; then
-		gsettings set org.gnome.desktop.background picture-uri-dark "file://$background"
-		gsettings set org.gnome.desktop.background picture-uri "file://$background"
-	else
-		feh --bg-fill --no-xinerama --no-fehbg $background	
-	fi
+	background=$(ls ~/pictures/wallpapers/4K/* | shuf -n 1)
+	swaybg -i $background -m fill
 	sleep 30m
 done &
