@@ -1,0 +1,2 @@
+#!/bin/sh
+grim "$HOME/pictures/screenshots/$(date +'%m-%d-%Y-%H%M%S').png"
