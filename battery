@@ -1,0 +1,10 @@
+#!/bin/bash
+
+battery_dir=$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -n 1)
+if [ -f "$battery_dir/capacity" ]; then
+    percent=$(cat "$battery_dir/capacity")
+    echo "Battery Level: $percent%"
+else
+    echo "Cannot read battery percentage."
+    exit 1
+fi
