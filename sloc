@@ -1,0 +1,2 @@
+#!/bin/sh
+awk NF $1 | wc -l
