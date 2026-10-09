@@ -1,0 +1,14 @@
+#!/bin/sh
+# Redraw the status bar now (used by the brightness and volume keys).
+# `statusbar-refresh all` toggles showing every module for a few seconds.
+if [ "$1" = all ]; then
+    f="${XDG_RUNTIME_DIR:-/tmp}/statusbar.showall"
+    now=$(date +%s)
+    if [ -f "$f" ] && [ "$now" -lt "$(cat "$f")" ]; then
+        rm -f "$f"
+    else
+        echo $((now + 6)) > "$f"
+    fi
+fi
+kill -USR1 "$(cat "${XDG_RUNTIME_DIR:-/tmp}/statusbar.pid" 2>/dev/null)" 2>/dev/null
+exit 0

@@ -1,0 +1,243 @@
+#!/bin/bash
+# swaybar status line. Modules that only matter sometimes stay hidden until they do:
+#   the playing track, do-not-disturb, cpu/ram/disk when high, battery when low, brightness and volume for a few seconds
+#   after a change, network when there is traffic, bluetooth while a device is connected,
+#   wifi only while offline.
+# Send SIGUSR1 (see statusbar-refresh) to redraw immediately.
+# `statusbar-refresh all` shows every module for a few seconds (toggle).
+#
+# Modules set $res instead of printing, so they can keep state between refreshes.
+# Thresholds can be overridden from the environment; for disk and net, 0 means always show.
+
+: "${IDLE:=10}"          # seconds between refreshes
+: "${SHOW_CHANGE:=3}"    # seconds to show brightness/volume after they change
+: "${CPU_HIGH:=80}"      # percent
+: "${MEM_HIGH:=85}"      # percent
+: "${DISK_HIGH:=85}"     # percent used on /
+: "${BAT_LOW:=20}"       # percent
+: "${NET_MIN:=50}"       # KiB/s, down or up
+: "${MEDIA_MAX:=40}"     # characters of "artist - title" to show
+
+export LC_ALL=C.UTF-8   # so the track title is cut on characters, not bytes
+shopt -u patsub_replacement 2>/dev/null   # bash 5.2: '&' in a ${var//a/b} replacement would mean "the match"
+
+esc() { REPLY=${1//&/&amp;}; REPLY=${REPLY//</&lt;}; REPLY=${REPLY//>/&gt;}; }   # markup-safe text -> $REPLY
+
+# Colours: One Dark Darker, same as ~/.config/sway/config. Needs `pango_markup enabled` in the bar.
+RED='#e55561'; ORANGE='#f0a45d'; GREEN='#8ebd6b'; YELLOW='#e2b86b'; BLUE='#4fa6ed'; CYAN='#48b0bd'; PURPLE='#bf68d9'; DIM='#7a818e'
+paint() { printf -v res '<span foreground="%s">%s</span>' "$1" "$2"; }   # paint COLOR TEXT -> $res
+
+showall_file="${XDG_RUNTIME_DIR:-/tmp}/statusbar.showall"   # holds the epoch time to stop showing everything
+
+pidfile="${XDG_RUNTIME_DIR:-/tmp}/statusbar.pid"
+echo $$ > "$pidfile"
+poke=0
+trap 'poke=1' USR1   # remembered, so a signal during a redraw is not lost
+
+# redraw when a player changes track or play state (playerctl blocks until something changes)
+follower=""
+if command -v playerctl >/dev/null; then
+    { playerctl --all-players --follow metadata --format '{{status}} {{artist}} {{title}}' 2>/dev/null |
+        while read -r _; do kill -USR1 $$ 2>/dev/null; done; } &
+    follower=$!
+fi
+trap '[ "$(cat "$pidfile" 2>/dev/null)" = "$$" ] && rm -f "$pidfile"; [ -n "$follower" ] && { pkill -P "$follower" 2>/dev/null; kill "$follower" 2>/dev/null; }' EXIT
+
+bright() { timeout 1 brightnessctl -c backlight -m 2>/dev/null | cut -d, -f4; }
+
+cpu_sample() {
+    local _ u n s i w q sq st
+    read -r _ u n s i w q sq st _ < /proc/stat
+    cur_total=$((u + n + s + i + w + q + sq + st))
+    cur_idle=$((i + w))
+}
+
+last_bright=$(bright)
+bright_until=0
+last_vol=""
+vol_until=0
+cpu_sample; prev_total=$cur_total; prev_idle=$cur_idle
+
+net_sample() {   # sets net_rx, net_tx (bytes since boot, all real interfaces) and net_t (microseconds)
+    read -r net_rx net_tx < <(awk '/:/ {split($0, a, ":"); name = a[1]; gsub(/ /, "", name); if (name !~ /^(lo|docker|veth|br-|virbr)/) {split(a[2], f, " "); rx += f[1]; tx += f[9]}} END {print rx + 0, tx + 0}' /proc/net/dev)
+    net_t=${EPOCHREALTIME/./}
+}
+net_sample; prev_rx=$net_rx; prev_tx=$net_tx; prev_t=$net_t
+rx_rate=0; tx_rate=0
+
+fmt_rate() {   # bytes/s -> 0B / 12K / 1.4M
+    local r=$1
+    if [ "$r" -ge 1048576 ]; then echo "$((r * 10 / 1048576 / 10)).$((r * 10 / 1048576 % 10))M"
+    elif [ "$r" -ge 1024 ]; then echo "$((r / 1024))K"
+    else echo "${r}B"
+    fi
+}
+
+media() {
+    local line status artist title text icon
+    # one line per player: the first one that is playing wins; in all-mode a paused one is shown too
+    line=$(timeout 1 playerctl --all-players metadata --format '{{status}}|{{artist}}|{{title}}' 2>/dev/null | grep -m1 '^Playing|')
+    if [ -z "$line" ] && [ "$all" = 1 ]; then
+        line=$(timeout 1 playerctl --all-players metadata --format '{{status}}|{{artist}}|{{title}}' 2>/dev/null | grep -m1 '^Paused|')
+    fi
+    [ -n "$line" ] || return
+    status=${line%%|*}; line=${line#*|}
+    artist=${line%%|*}; title=${line#*|}
+    text=$title
+    [ -n "$artist" ] && text="$artist - $title"
+    [ "${#text}" -gt "$MEDIA_MAX" ] && text="${text:0:$((MEDIA_MAX - 1))}…"
+    esc "$text"; text=$REPLY
+    icon=󰎆; [ "$status" = Paused ] && icon=󰏤
+    paint "$ORANGE" "$icon $text"
+}
+
+dnd() {
+    timeout 1 makoctl mode 2>/dev/null | grep -q do-not-disturb && paint "$RED" "󰂛"
+}
+
+cpu() {
+    local pct dt
+    cpu_sample
+    dt=$((cur_total - prev_total))
+    pct=0
+    [ "$dt" -gt 0 ] && pct=$(( 100 * (dt - (cur_idle - prev_idle)) / dt ))
+    prev_total=$cur_total; prev_idle=$cur_idle
+    if [ "$all" = 1 ] || [ "$pct" -ge "$CPU_HIGH" ]; then
+        col=$CYAN; [ "$pct" -ge "$CPU_HIGH" ] && col=$RED
+        paint "$col" "󰍛 $pct%"
+    fi
+}
+
+mem() {
+    local pct
+    pct=$(awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {printf "%d", 100 * (t - a) / t}' /proc/meminfo)
+    if [ "$all" = 1 ] || [ "$pct" -ge "$MEM_HIGH" ]; then
+        col=$PURPLE; [ "$pct" -ge "$MEM_HIGH" ] && col=$RED
+        paint "$col" "󰘚 $pct%"
+    fi
+}
+
+brightness() {
+    local now cur
+    now=$(date +%s)
+    cur=$(bright)
+    if [ -n "$cur" ] && [ "$cur" != "$last_bright" ]; then
+        last_bright=$cur
+        bright_until=$((now + SHOW_CHANGE))
+    fi
+    { [ "$all" = 1 ] || [ "$now" -lt "$bright_until" ]; } && paint "$YELLOW" "󰃟 $cur"
+}
+
+disk() {
+    local pct
+    pct=$(timeout 1 df --output=pcent / 2>/dev/null | tail -1 | tr -dc '0-9')
+    [ -n "$pct" ] || return
+    if [ "$all" = 1 ] || [ "$pct" -ge "$DISK_HIGH" ]; then
+        col=$YELLOW; [ "$pct" -ge "$DISK_HIGH" ] && col=$RED
+        paint "$col" "󰋊 $pct%"
+    fi
+}
+
+net() {
+    local dt
+    net_sample
+    dt=$((net_t - prev_t))
+    # keep the previous rates if redraws come in too fast to measure
+    if [ "$dt" -ge 500000 ]; then
+        rx_rate=$(( (net_rx - prev_rx) * 1000000 / dt )); [ "$rx_rate" -lt 0 ] && rx_rate=0
+        tx_rate=$(( (net_tx - prev_tx) * 1000000 / dt )); [ "$tx_rate" -lt 0 ] && tx_rate=0
+        prev_rx=$net_rx; prev_tx=$net_tx; prev_t=$net_t
+    fi
+    if [ "$all" = 1 ] || [ "$rx_rate" -ge $((NET_MIN * 1024)) ] || [ "$tx_rate" -ge $((NET_MIN * 1024)) ]; then
+        printf -v res '<span foreground="%s">󰇚 %s</span> <span foreground="%s">󰕒 %s</span>' \
+            "$GREEN" "$(fmt_rate "$rx_rate")" "$BLUE" "$(fmt_rate "$tx_rate")"
+    fi
+}
+
+battery() {
+    local out pct
+    out=$("$HOME/Projects/scripts/battery") || return
+    pct=${out##* }; pct=${pct%\%}
+    if [ "$all" = 1 ] || [ "$pct" -le "$BAT_LOW" ]; then
+        col=$GREEN
+        [ "$pct" -le 50 ] && col=$YELLOW
+        [ "$pct" -le "$BAT_LOW" ] && col=$RED
+        [[ $out == 󰂄* ]] && col=$GREEN   # charging
+        paint "$col" "$out"
+    fi
+}
+
+bluetooth() {
+    local n
+    n=$(timeout 1 bluetoothctl devices Connected 2>/dev/null | grep -c '^Device')
+    if [ "$n" -gt 0 ]; then paint "$BLUE" "󰂱 $n"
+    elif [ "$all" = 1 ]; then paint "$DIM" "󰂯"
+    fi
+}
+
+wifi() {
+    local ssid
+    if timeout 1 nmcli -t -f TYPE,STATE device 2>/dev/null | grep -qE '^(wifi|ethernet):connected$'; then
+        if [ "$all" = 1 ]; then
+            # --rescan no: listing otherwise waits for a fresh scan, which can block for many seconds
+            ssid=$(timeout 1 nmcli -t -f ACTIVE,SSID device wifi list --rescan no 2>/dev/null | sed -n 's/^yes://p' | head -1)
+            esc "$ssid"; ssid=$REPLY
+            paint "$GREEN" "${ssid:+󰖩 $ssid}"
+            [ -z "$ssid" ] && paint "$GREEN" "󰈀"
+        fi
+    else
+        paint "$RED" "󰖪"
+    fi
+}
+
+volume() {
+    local out pct icon
+    out=$(timeout 1 wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null) || return
+    pct=$(echo "$out" | awk '{printf "%d", $2 * 100}')
+    col=$CYAN
+    if [[ $out == *MUTED* ]]; then icon=󰝟; col=$DIM
+    elif [ "$pct" -lt 34 ]; then icon=󰕿
+    elif [ "$pct" -lt 67 ]; then icon=󰖀
+    else icon=󰕾
+    fi
+    local cur="$icon $pct%" now
+    now=$(date +%s)
+    if [ "$cur" != "$last_vol" ]; then
+        [ -n "$last_vol" ] && vol_until=$((now + SHOW_CHANGE))
+        last_vol=$cur
+    fi
+    { [ "$all" = 1 ] || [ "$now" -lt "$vol_until" ]; } && paint "$col" "$cur"
+}
+
+while :; do
+    poke=0
+    all=0
+    if [ -f "$showall_file" ]; then
+        if [ "$(date +%s)" -lt "$(cat "$showall_file")" ]; then all=1; else rm -f "$showall_file"; fi
+    fi
+    parts=()
+    for m in media cpu mem disk net brightness bluetooth wifi volume dnd battery; do
+        res=""
+        $m
+        [ -n "$res" ] && parts+=("$res")
+    done
+    printf -v res '<span foreground="%s">󰃭</span> %s  <span foreground="%s">󰅐</span> %s' "$DIM" "$(date '+%a %d %b')" "$DIM" "$(date '+%H:%M')"
+    parts+=("$res")
+    line=${parts[0]}
+    for p in "${parts[@]:1}"; do line+="  $p"; done
+    printf '%s\n' "$line"
+
+    # a signal arrived while we were drawing: draw again right away
+    [ "$poke" = 1 ] && continue
+
+    # poll quickly while something temporary is on screen so it disappears on time
+    delay=$IDLE
+    now=$(date +%s)
+    { [ "$all" = 1 ] || [ "$now" -lt "$bright_until" ] || [ "$now" -lt "$vol_until" ]; } && delay=1
+    # sleep in 1s steps; a signal ends the sleep early and nothing can slip between check and sleep
+    for ((t = 0; t < delay && poke == 0; t++)); do
+        sleep 1 & sl=$!
+        wait "$sl"
+        kill "$sl" 2>/dev/null
+    done
+done
