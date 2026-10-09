@@ -1,10 +1,20 @@
 #!/bin/bash
+# Compact battery status for the status bar, e.g. "󰁿 72%" or "󰂄 72%" when charging.
 
 battery_dir=$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -n 1)
-if [ -f "$battery_dir/capacity" ]; then
-    percent=$(cat "$battery_dir/capacity")
-    echo "Battery Level: $percent%"
-else
+if [ ! -f "$battery_dir/capacity" ]; then
     echo "Cannot read battery percentage."
     exit 1
 fi
+
+percent=$(cat "$battery_dir/capacity")
+status=$(cat "$battery_dir/status")
+
+icons=(󰂎 󰁺 󰁻 󰁼 󰁽 󰁾 󰁿 󰂀 󰂁 󰂂 󰁹)
+icon=${icons[$((percent / 10))]}
+case $status in
+    Charging) icon=󰂄 ;;
+    Full) icon=󰁹 ;;
+esac
+
+echo "$icon $percent%"
