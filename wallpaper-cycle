@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Rotate a random wallpaper from ~/Pictures/Wallpapers via sway's own `output bg`.
+# Usage: wallpaper-cycle [interval-seconds]   (default 1800)
+# Send SIGUSR1 to skip to the next one: pkill -USR1 -f '^bash .*wallpaper-cycle'
+DIR="$HOME/Pictures/Wallpapers"
+INTERVAL="${1:-1800}"
+CONF="$HOME/.config/sway/wallpaper.conf"
+
+trap 'kill "$sleeper" 2>/dev/null' USR1
+trap 'kill "$sleeper" 2>/dev/null; exit' TERM INT
+
+while true; do
+    img=$(find "$DIR" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | shuf -n 1)
+    if [ -n "$img" ]; then
+        # persisted so a sway reload re-applies the current wallpaper (included from the sway config)
+        printf 'output * bg "%s" fill\n' "$img" > "$CONF"
+        swaymsg output '*' bg "$img" fill >/dev/null
+    fi
+    sleep "$INTERVAL" &
+    sleeper=$!
+    wait "$sleeper"
+done
