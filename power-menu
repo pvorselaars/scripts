@@ -1,0 +1,14 @@
+#!/bin/sh
+# Power menu in fuzzel. Reboot and shutdown ask for confirmation.
+confirm() { [ "$(printf 'No\nYes\n' | fuzzel --dmenu --prompt "$1? " --lines 2 --width 20)" = Yes ]; }
+
+choice=$(printf '%s\n' '󰌾 Lock' '󰤄 Suspend' '󰍃 Logout' '󰜉 Reboot' '󰐥 Shutdown' |
+    fuzzel --dmenu --prompt 'power> ' --lines 5 --width 20) || exit 0
+
+case $choice in
+    *Lock)     loginctl lock-session ;;   # swayidle runs the lock command on this
+    *Suspend)  systemctl suspend ;;
+    *Logout)   confirm Logout   && swaymsg exit ;;
+    *Reboot)   confirm Reboot   && systemctl reboot ;;
+    *Shutdown) confirm Shutdown && systemctl poweroff ;;
+esac

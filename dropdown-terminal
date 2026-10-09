@@ -1,0 +1,7 @@
+#!/bin/sh
+# Toggle a foot terminal that lives in the sway scratchpad (placement is in the sway config).
+if swaymsg -t get_tree | jq -e '.. | select(.app_id? == "dropdown")' >/dev/null; then
+    swaymsg '[app_id="dropdown"] scratchpad show' >/dev/null
+else
+    foot --app-id dropdown &
+fi

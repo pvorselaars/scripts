@@ -1,0 +1,25 @@
+#!/bin/bash
+# Notify once when the battery drops to 15% and again at 5% (run every minute by a systemd user timer).
+# BAT_SYS can point at another directory for testing.
+sys=${BAT_SYS:-/sys/class/power_supply}
+bat=$(ls -d "$sys"/BAT* 2>/dev/null | head -n 1)
+[ -f "$bat/capacity" ] || exit 0
+
+cap=$(cat "$bat/capacity")
+status=$(cat "$bat/status")
+state="${XDG_RUNTIME_DIR:-/tmp}/battery-warn.level"   # lowest level already warned about
+
+# plugged in: forget previous warnings so the next discharge warns again
+if [ "$status" != Discharging ]; then
+    rm -f "$state"
+    exit 0
+fi
+
+last=$(cat "$state" 2>/dev/null || echo 100)
+if [ "$cap" -le 5 ] && [ "$last" -gt 5 ]; then
+    notify-send -u critical -a battery "Battery critical" "$cap% left. Plug in now."
+    echo 5 > "$state"
+elif [ "$cap" -le 15 ] && [ "$last" -gt 15 ]; then
+    notify-send -u normal -a battery "Battery low" "$cap% left."
+    echo 15 > "$state"
+fi

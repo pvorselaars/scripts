@@ -1,0 +1,15 @@
+#!/bin/sh
+# Called by sway on lid events: lid-handler close|open
+# Docked (an external display is active): just turn the laptop panel off and keep working.
+# Undocked: do nothing here; logind suspends and swayidle locks before sleep.
+INTERNAL=eDP-1
+case "$1" in
+    close)
+        external=$(swaymsg -t get_outputs -r | jq --arg i "$INTERNAL" '[.[] | select(.active and .name != $i)] | length')
+        [ "$external" -gt 0 ] && swaymsg output "$INTERNAL" disable >/dev/null
+        ;;
+    open)
+        swaymsg output "$INTERNAL" enable >/dev/null
+        ;;
+esac
+exit 0
