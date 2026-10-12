@@ -6,6 +6,7 @@
 #   prof stat    -- CMD [ARGS]     perf stat: cycles, instructions, IPC, cache and branch misses (5 runs)
 #   prof flame   -- CMD [ARGS]     perf record + flame graph in speedscope
 #   prof report                    perf report (terminal) for the newest recording
+#   prof hotspot [FILE]            open a perf recording in hotspot (default: the newest)
 #   prof callgrind -- CMD [ARGS]   exact instruction counts per function (slow: ~50x)
 #   prof heap    -- CMD [ARGS]     heaptrack: allocations, peak memory, leaks
 #
@@ -19,7 +20,7 @@ export PATH="$HOME/.local/bin:$HOME/.dotnet/tools:$PATH"
 dir=${PROF_DIR:-.bench}
 ts=$(date +%Y%m%d-%H%M%S)
 
-usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
 die() { echo "prof: $*" >&2; exit 1; }
 need() { [ -n "$PROF_DRY" ] || command -v "$1" >/dev/null || die "$1 not found${2:+ ($2)}"; }
 run() { if [ -n "$PROF_DRY" ]; then echo "+ $*"; else "$@"; fi; }
@@ -52,12 +53,17 @@ case $sub in
         else rec "${PROF_EVENT:-cycles:u}" 2>/dev/null || { echo "prof: cycles:u unavailable, using the software clock" >&2; rec cpu-clock:u; } || exit $?; fi
         if [ -n "$PROF_DRY" ]; then echo "+ perf script -i $data -F +pid > $text"; else perf script -i "$data" -F +pid > "$text" || exit $?; fi
         view "$text"
-        echo "terminal view: prof report"
+        echo "other views: prof report (terminal), prof hotspot (GUI)"
         ;;
     report)
         need perf "sudo dnf install perf"
         data=$(ls -1t "$dir"/perf-*.data 2>/dev/null | head -n 1); [ -n "$data" ] || die "no recording in $dir (run prof flame first)"
         run perf report -i "$data"
+        ;;
+    hotspot)
+        need hotspot "sudo dnf install hotspot"
+        data=${1:-$(ls -1t "$dir"/perf-*.data 2>/dev/null | head -n 1)}; [ -n "$data" ] || die "no recording in $dir (run prof flame first)"
+        if [ -n "$PROF_DRY" ]; then echo "+ hotspot $data"; else setsid -f hotspot "$data" >/dev/null 2>&1; echo "opened $data in hotspot"; fi
         ;;
     callgrind)
         cmdargs "$@"; need valgrind "sudo dnf install valgrind"; mkdir -p "$dir"
