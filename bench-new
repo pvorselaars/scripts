@@ -1,0 +1,49 @@
+#!/bin/bash
+# bench-new [DIR]: scaffold a BenchmarkDotNet console project (default ./Benchmarks) with a working example.
+# Run it with:   dotnet run -c Release -- --filter '*'         (add --job short for a quick pass)
+# BenchmarkDotNet needs a Release build; results land in BenchmarkDotNet.Artifacts/.
+dir=${1:-Benchmarks}
+[ -e "$dir" ] && { echo "bench-new: $dir already exists" >&2; exit 1; }
+command -v dotnet >/dev/null || { echo "bench-new: dotnet not found" >&2; exit 127; }
+
+dotnet new console -o "$dir" --no-restore >/dev/null || exit $?
+cd "$dir" || exit 1
+dotnet add package BenchmarkDotNet >/dev/null || exit $?
+
+cat > Program.cs <<'CS'
+using BenchmarkDotNet.Attributes;
+using BenchmarkDotNet.Running;
+
+BenchmarkSwitcher.FromAssembly(typeof(StringJoin).Assembly).Run(args);
+
+// An example to copy from: three ways to join 100 words. Baseline = 1.00 in the ratio column;
+// MemoryDiagnoser adds allocated bytes and GC counts, which is often where the real difference is.
+[MemoryDiagnoser]
+public class StringJoin
+{
+    private readonly string[] _words = Enumerable.Range(0, 100).Select(i => $"word{i}").ToArray();
+
+    [Benchmark(Baseline = true)]
+    public string Concatenate()
+    {
+        var s = "";
+        foreach (var w in _words) s += w;
+        return s;
+    }
+
+    [Benchmark]
+    public string Builder()
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var w in _words) sb.Append(w);
+        return sb.ToString();
+    }
+
+    [Benchmark]
+    public string Concat() => string.Concat(_words);
+}
+CS
+
+printf 'bin/\nobj/\nBenchmarkDotNet.Artifacts/\n.bench/\n' > .gitignore
+echo "created $dir"
+echo "run it:  cd $dir && dotnet run -c Release -- --filter '*'"
