@@ -32,9 +32,11 @@ frame pointers so `perf` can walk the stack.
   Then look at the cache and branch miss rates.
 - `prof flame`: records with `perf`, opens speedscope. Use **Left Heavy** to see the biggest
   consumers first, **Sandwich** to see a function with all its callers and callees.
-  `prof report` shows the same recording as text in the terminal.
+  `prof report` shows the same recording as text in the terminal, and `prof hotspot` opens it in
+  hotspot (GUI: flame graph, caller/callee tables, per-line cost, timeline of threads).
 - `prof callgrind`: exact instruction counts per function and line, about 50 times slower than
-  normal. Use a small input. Deterministic, so it is good for comparing two versions.
+  normal. Use a small input. Deterministic, so it is good for comparing two versions. Opens in
+  kcachegrind, where the **Callee Map** and **Source Code** tabs show the cost line by line.
 - `prof heap`: allocation counts, peak memory, leaks, and the call site that allocates the most.
 
 ## C#
@@ -70,7 +72,7 @@ The measurement corrected the guess, which is the point of doing it.
 - `kernel.perf_event_paranoid=2` (the default): `perf` profiles your own user-space code only.
   `prof flame` therefore records user-space call chains (`--user-callchains`). Kernel
   profiling needs a root change to that setting.
-- `kcachegrind` and `hotspot` are optional GUI viewers. Without them `prof callgrind` prints a
-  text summary and speedscope is the flame graph viewer.
+- Without `kcachegrind` installed, `prof callgrind` prints a text summary instead. The
+  flame graph viewer for both C and .NET is speedscope (`npm install -g --prefix ~/.local speedscope`).
 - `heaptrack` opens its GUI on its own after recording; `prof heap` passes `--record-only` and
   prints a text summary. Open the GUI yourself with `heaptrack_gui FILE`.
