@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>New tab</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <!--WALLPAPER-->
+  <div id="dim" aria-hidden="true"></div>
+
+  <main>
+    <header>
+      <div id="clock">--:--</div>
+      <div id="date"></div>
+      <div id="greeting"></div>
+    </header>
+
+    <form id="search" role="search" autocomplete="off">
+      <label class="sr-only" for="q">Search or enter an address</label>
+      <input id="q" type="text" placeholder="Search DuckDuckGo or type an address" spellcheck="false" autofocus>
+    </form>
+
+    <div class="columns">
+      <section id="todos" aria-labelledby="todos-title">
+        <div class="card-head">
+          <h2 id="todos-title">Todos <span id="todo-count"></span></h2>
+          <span id="status" role="status" aria-live="polite"></span>
+        </div>
+        <form id="add" autocomplete="off">
+          <label class="sr-only" for="add-text">Add a todo</label>
+          <input id="add-text" type="text" placeholder="Add a todo to today's note" maxlength="500">
+        </form>
+        <div id="todo-groups"></div>
+      </section>
+
+      <nav id="links" aria-label="Bookmarks"></nav>
+    </div>
+  </main>
+
+  <footer id="credit"></footer>
+
+  <script id="state" type="application/json">__STATE__</script>
+  <script src="/lib.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
