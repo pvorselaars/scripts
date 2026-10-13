@@ -194,6 +194,7 @@ const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 's
   + "base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 function createServer(cfg) {
+  const log = cfg.log ?? ((message) => console.log(message)); // every write to a note is logged (journalctl --user -u homepage)
   let allowedHosts = new Set();
   let allowedOrigins = new Set();
 
@@ -223,8 +224,17 @@ function createServer(cfg) {
       }
       if (route === 'GET /api/todos') return sendJson(res, 200, await listTodos(cfg));
       if (route === 'GET /api/wallpaper') return sendJson(res, 200, pickWallpaper(cfg));
-      if (route === 'POST /api/todos/toggle') return sendJson(res, 200, await toggleTodo(cfg, await readJson(req)));
-      if (route === 'POST /api/todos/add') return sendJson(res, 200, await addTodo(cfg, await readJson(req)));
+      if (route === 'POST /api/todos/toggle') {
+        const body = await readJson(req);
+        const result = await toggleTodo(cfg, body);
+        if (result.changed) log(`toggle ${body.file}:${result.line} -> ${body.done ? 'done' : 'open'}: ${body.text.slice(0, 80)}`);
+        return sendJson(res, 200, result);
+      }
+      if (route === 'POST /api/todos/add') {
+        const result = await addTodo(cfg, await readJson(req));
+        log(`add ${result.file}:${result.todo.line}: ${result.todo.text.slice(0, 80)}`);
+        return sendJson(res, 200, result);
+      }
 
       if (req.method === 'GET' && url.pathname.startsWith('/wallpaper/')) {
         const name = decodeURIComponent(url.pathname.slice('/wallpaper/'.length));

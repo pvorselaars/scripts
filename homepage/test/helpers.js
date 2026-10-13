@@ -10,14 +10,14 @@ const today = localDate();
 function tempDir(prefix = 'homepage-test-') { return fs.mkdtempSync(path.join(os.tmpdir(), prefix)); }
 
 // a notes folder, wallpaper folder and server on an ephemeral port
-async function start({ notes = {}, wallpapers = {} } = {}) {
+async function start({ notes = {}, wallpapers = {}, log = () => {} } = {}) {
   const notesDir = tempDir('notes-');
   const wallpaperDir = tempDir('wall-');
   for (const [name, content] of Object.entries(notes)) fs.writeFileSync(path.join(notesDir, name), content);
   for (const [name, content] of Object.entries(wallpapers)) fs.writeFileSync(path.join(wallpaperDir, name), content);
   const cfg = {
     host: '127.0.0.1', port: 0, notesDir, wallpaperDir,
-    name: 'Tester', publicDir: path.join(__dirname, '..', 'public'),
+    name: 'Tester', log, publicDir: path.join(__dirname, '..', 'public'),
   };
   const server = createServer(cfg);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));

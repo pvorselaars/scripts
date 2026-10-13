@@ -86,6 +86,7 @@ It listens on `127.0.0.1` only and can write to your notes, so it checks every r
   Content-Security-Policy (no inline scripts or styles, no other origins). Text in a note cannot
   inject markup.
 - The systemd unit makes everything except `~/Notes` read-only and the service cannot gain privileges.
+- Every write to a note is logged: `journalctl --user -u homepage` shows what changed and when.
 
 ## Files
 
