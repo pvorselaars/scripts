@@ -19,24 +19,20 @@
 
     <form id="search" role="search" autocomplete="off">
       <label class="sr-only" for="q">Search or enter an address</label>
-      <input id="q" type="text" placeholder="Search DuckDuckGo or type an address" spellcheck="false" autofocus>
+      <input id="q" type="text" placeholder="Search or type an address" spellcheck="false" autofocus>
     </form>
 
-    <div class="columns">
-      <section id="todos" aria-labelledby="todos-title">
-        <div class="card-head">
-          <h2 id="todos-title">Todos <span id="todo-count"></span></h2>
-          <span id="status" role="status" aria-live="polite"></span>
-        </div>
-        <form id="add" autocomplete="off">
-          <label class="sr-only" for="add-text">Add a todo</label>
-          <input id="add-text" type="text" placeholder="Add a todo to today's note" maxlength="500">
-        </form>
-        <div id="todo-groups"></div>
-      </section>
-
-      <nav id="links" aria-label="Bookmarks"></nav>
-    </div>
+    <section id="todos" aria-labelledby="todos-title">
+      <div class="card-head">
+        <h2 id="todos-title">Todos <span id="todo-count"></span></h2>
+        <span id="status" role="status" aria-live="polite"></span>
+      </div>
+      <form id="add" autocomplete="off">
+        <label class="sr-only" for="add-text">Add a todo</label>
+        <input id="add-text" type="text" placeholder="Add a todo" maxlength="500">
+      </form>
+      <div id="todo-groups"></div>
+    </section>
   </main>
 
   <footer id="credit"></footer>

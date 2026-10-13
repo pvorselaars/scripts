@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Start page for the browser: clock, search, todos from the notes in ~/Notes, Firefox bookmarks,
-// a wallpaper. No dependencies. Listens on 127.0.0.1 only. See README.md.
+// Start page for the browser: clock, search, todos from the notes in ~/Notes, a wallpaper.
+// No dependencies. Listens on 127.0.0.1 only. See README.md.
 'use strict';
 
 const http = require('node:http');
@@ -8,7 +8,6 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const { DatabaseSync } = require('node:sqlite');
 
 const MAX_BODY = 10_000;
 const MAX_TODO_LENGTH = 500;
@@ -33,7 +32,6 @@ function loadConfig(env = process.env) {
     port: Number(env.HOMEPAGE_PORT ?? 7878),
     notesDir: path.resolve(env.NOTES_DIR ?? path.join(home, 'Notes')),
     wallpaperDir: path.resolve(env.WALLPAPER_DIR ?? path.join(home, 'Pictures', 'Wallpapers')),
-    firefoxProfile: env.FIREFOX_PROFILE ?? '',
     name: env.HOMEPAGE_NAME ?? user.charAt(0).toUpperCase() + user.slice(1),
     publicDir: path.join(__dirname, 'public'),
   };
@@ -142,68 +140,6 @@ async function addTodo(cfg, body) {
   return { ok: true, file, todo: { line: lineCount, text, done: false, indent: 0 } };
 }
 
-// ---- Firefox bookmarks -----------------------------------------------------------------------
-
-function findPlaces(cfg) {
-  if (cfg.firefoxProfile) return path.join(cfg.firefoxProfile, 'places.sqlite');
-  const home = os.homedir();
-  const candidates = [];
-  for (const root of [path.join(home, '.config', 'mozilla', 'firefox'), path.join(home, '.mozilla', 'firefox')]) {
-    let dirs = [];
-    try { dirs = fs.readdirSync(root); } catch { continue; }
-    for (const dir of dirs) {
-      const db = path.join(root, dir, 'places.sqlite');
-      if (!fs.existsSync(db)) continue;
-      const wal = `${db}-wal`;
-      const newest = Math.max(fs.statSync(db).mtimeMs, fs.existsSync(wal) ? fs.statSync(wal).mtimeMs : 0);
-      candidates.push({ db, newest });
-    }
-  }
-  candidates.sort((a, b) => b.newest - a.newest);
-  return candidates[0]?.db ?? null;
-}
-
-function readBookmarks(placesFile) {
-  if (!placesFile || !fs.existsSync(placesFile)) return [];
-  // Firefox keeps the live database locked: work on a copy (with its write-ahead log)
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'homepage-'));
-  try {
-    for (const ext of ['', '-wal']) {
-      if (fs.existsSync(placesFile + ext)) fs.copyFileSync(placesFile + ext, path.join(tmp, `places.sqlite${ext}`));
-    }
-    const db = new DatabaseSync(path.join(tmp, 'places.sqlite'));
-    const rows = db.prepare(
-      `SELECT b.title AS title, p.url AS url FROM moz_bookmarks b JOIN moz_places p ON b.fk = p.id
-       WHERE b.type = 1 AND p.url NOT LIKE 'place:%' ORDER BY b.title COLLATE NOCASE`).all();
-    db.close();
-    const seen = new Set();
-    const out = [];
-    for (const { title, url } of rows) {
-      if (!/^https?:\/\//i.test(url) || seen.has(url)) continue;
-      seen.add(url);
-      let label = title;
-      if (!label) { try { label = new URL(url).hostname; } catch { label = url; } }
-      out.push({ title: label, url });
-    }
-    // sort by the label we show (untitled bookmarks are labelled with their host), not by the raw title
-    return out.sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base' }));
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
-  }
-}
-
-function makeBookmarkCache(cfg, ttlMs = 60_000) {
-  let value = null;
-  let at = 0;
-  return () => {
-    if (!value || Date.now() - at > ttlMs) {
-      try { value = readBookmarks(findPlaces(cfg)); } catch (error) { console.error('bookmarks:', error.message); value = value ?? []; }
-      at = Date.now();
-    }
-    return value;
-  };
-}
-
 // ---- wallpaper -------------------------------------------------------------------------------
 
 function listWallpapers(cfg) {
@@ -258,7 +194,6 @@ const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 's
   + "base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 function createServer(cfg) {
-  const bookmarks = makeBookmarkCache(cfg);
   let allowedHosts = new Set();
   let allowedOrigins = new Set();
 
@@ -277,7 +212,7 @@ function createServer(cfg) {
 
       if (route === 'GET /') {
         const html = await fsp.readFile(path.join(cfg.publicDir, 'index.html'), 'utf8');
-        const state = { name: cfg.name, todos: await listTodos(cfg), bookmarks: bookmarks(), wallpaper: pickWallpaper(cfg) };
+        const state = { name: cfg.name, todos: await listTodos(cfg), wallpaper: pickWallpaper(cfg) };
         const picture = state.wallpaper ? `<img id="bg" alt="" src="${escapeAttr(state.wallpaper.url)}">` : '';
         return send(res, 200, html.replace('<!--WALLPAPER-->', () => picture).replace('__STATE__', () => embed(state)),
           { 'Content-Type': MIME['.html'], 'Cache-Control': 'no-store', 'Content-Security-Policy': CSP });
@@ -287,7 +222,6 @@ function createServer(cfg) {
         return send(res, 200, await fsp.readFile(file), { 'Content-Type': MIME[path.extname(file)], 'Cache-Control': 'no-cache' });
       }
       if (route === 'GET /api/todos') return sendJson(res, 200, await listTodos(cfg));
-      if (route === 'GET /api/bookmarks') return sendJson(res, 200, bookmarks());
       if (route === 'GET /api/wallpaper') return sendJson(res, 200, pickWallpaper(cfg));
       if (route === 'POST /api/todos/toggle') return sendJson(res, 200, await toggleTodo(cfg, await readJson(req)));
       if (route === 'POST /api/todos/add') return sendJson(res, 200, await addTodo(cfg, await readJson(req)));
@@ -329,4 +263,4 @@ if (require.main === module) {
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => server.close(() => process.exit(0)));
 }
 
-module.exports = { createServer, loadConfig, parseTodos, readBookmarks, captionFor, localDate };
+module.exports = { createServer, loadConfig, parseTodos, captionFor, localDate };

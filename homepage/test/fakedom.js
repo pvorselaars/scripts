@@ -34,7 +34,7 @@ class FakeNode {
 }
 class FakeText { constructor(t) { this.tagName = '#text'; this.textContent = t; this.children = []; } }
 
-const IDS = ['clock', 'date', 'greeting', 'search', 'q', 'todos', 'todo-count', 'status', 'add', 'add-text', 'todo-groups', 'links', 'credit', 'state', 'bg'];
+const IDS = ['clock', 'date', 'greeting', 'search', 'q', 'todos', 'todo-count', 'status', 'add', 'add-text', 'todo-groups', 'credit', 'state', 'bg'];
 
 function walk(node, fn) { fn(node); for (const c of node.children ?? []) walk(c, fn); }
 
@@ -51,7 +51,7 @@ function loadPage({ stateJson, base }) {
     addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn); },
   };
   document.activeElement = document.body;
-  const TAGS = { q: 'input', 'add-text': 'input', search: 'form', add: 'form', links: 'nav' };
+  const TAGS = { q: 'input', 'add-text': 'input', search: 'form', add: 'form' };
   for (const id of IDS) { const n = new FakeNode(TAGS[id] ?? 'div'); n.ownerDocument = document; document.byId[id] = n; }
   document.byId.state.textContent = stateJson;
 

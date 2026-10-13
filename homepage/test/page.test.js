@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { start, request, tempDir, makePlaces } = require('./helpers.js');
+const { start, request } = require('./helpers.js');
 const lib = require('../public/lib.js');
 
 const publicDir = path.join(__dirname, '..', 'public');
@@ -37,20 +37,15 @@ test('code spans split into text and code parts, with no markup produced', () =>
   assert.deepEqual(lib.splitCode('unclosed `tick'), [{ text: 'unclosed `tick' }]);
 });
 
-test('greeting follows the hour; clock is zero padded; only http(s) links are used', () => {
+test('greeting follows the hour; clock is zero padded', () => {
   const at = (h) => new Date(2026, 9, 23, h, 5);
   assert.deepEqual([2, 8, 13, 20].map((h) => lib.greeting(at(h))), ['Good night', 'Good morning', 'Good afternoon', 'Good evening']);
   assert.equal(lib.formatClock(at(7)), '07:05');
-  assert.equal(lib.safeHref('https://a.example'), 'https://a.example');
-  assert.equal(lib.safeHref('http://a.example'), 'http://a.example');
-  for (const bad of ['javascript:alert(1)', 'data:text/html,x', 'file:///etc/passwd', '//evil.com', '']) assert.equal(lib.safeHref(bad), null, bad);
 });
 
-test('the page embeds its state, and hostile note text or bookmark titles cannot break out of it', async () => {
+test('the page embeds its state, and hostile note text cannot break out of it', async () => {
   const evil = '</script><script>window.pwned=1</script><img src=x onerror=alert(1)> ';
-  const profile = tempDir('profile-');
-  makePlaces(profile, [[evil, 'https://ok.example/']]);
-  const s = await start({ notes: { 'x.md': `- [ ] ${evil}\n` }, profile });
+  const s = await start({ notes: { 'x.md': `- [ ] ${evil}\n` } });
   try {
     const r = await request(s.port, { path: '/' });
     assert.equal(r.status, 200);
@@ -60,8 +55,7 @@ test('the page embeds its state, and hostile note text or bookmark titles cannot
     const state = JSON.parse(json[1]);
     assert.equal(state.name, 'Tester');
     assert.equal(state.todos.notes[0].todos[0].text, evil, 'the text survives the round trip unchanged');
-    assert.equal(state.bookmarks[0].title, evil);
-  } finally { s.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+  } finally { s.close(); }
 });
 
 test('the page is served with a strict content security policy and no store caching', async () => {

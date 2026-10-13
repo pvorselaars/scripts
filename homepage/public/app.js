@@ -3,7 +3,7 @@
 (function () {
   'use strict';
 
-  const { classifyInput, splitCode, greeting, formatClock, formatDate, safeHref } = HomepageLib;
+  const { classifyInput, splitCode, greeting, formatClock, formatDate } = HomepageLib;
   const state = JSON.parse(document.getElementById('state').textContent);
   const $ = (id) => document.getElementById(id);
   const el = (tag, className, text) => {
@@ -37,31 +37,6 @@
     event.preventDefault();
     const target = classifyInput($('q').value);
     if (target) window.location.href = target.url;
-  });
-
-  // ---- bookmarks ---------------------------------------------------------------------------
-
-  function renderLinks() {
-    const nav = $('links');
-    nav.replaceChildren();
-    for (const bookmark of state.bookmarks) {
-      const href = safeHref(bookmark.url);
-      if (!href) continue;
-      const a = el('a', 'chip', bookmark.title);
-      a.href = href;
-      a.rel = 'noopener noreferrer';
-      a.title = href;
-      nav.append(a);
-    }
-    nav.hidden = nav.children.length === 0;
-  }
-
-  // typing in the search box dims the bookmarks that do not match
-  $('q').addEventListener('input', () => {
-    const q = $('q').value.trim().toLowerCase();
-    for (const chip of $('links').children) {
-      chip.classList.toggle('dim', q !== '' && !chip.textContent.toLowerCase().includes(q));
-    }
   });
 
   // ---- todos -------------------------------------------------------------------------------
@@ -193,6 +168,5 @@
   tick();
   setInterval(tick, 10_000);
   showCredit(state.wallpaper);
-  renderLinks();
   renderTodos();
 })();

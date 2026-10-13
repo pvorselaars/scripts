@@ -4,13 +4,12 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { start, request, tempDir, makePlaces, today } = require('./helpers.js');
+const { start, request, today } = require('./helpers.js');
 const { loadPage } = require('./fakedom.js');
 
-async function open(s, { mutateState } = {}) {
+async function open(s) {
   const html = (await request(s.port, { path: '/' })).text;
-  let stateJson = /<script id="state" type="application\/json">([\s\S]*?)<\/script>/.exec(html)[1];
-  if (mutateState) { const st = JSON.parse(stateJson); mutateState(st); stateJson = JSON.stringify(st); }
+  const stateJson = /<script id="state" type="application\/json">([\s\S]*?)<\/script>/.exec(html)[1];
   return loadPage({ stateJson, base: `http://127.0.0.1:${s.port}` });
 }
 const checkboxes = (page) => page.find(page.$('todo-groups'), (n) => n.tagName === 'INPUT');
@@ -111,25 +110,6 @@ test('search: urls open, text searches DuckDuckGo, empty does nothing', async ()
     assert.equal(submit('   '), before);
     assert.equal(submit('javascript:alert(1)').startsWith('https://duckduckgo.com/?q='), true);
   } finally { s.close(); }
-});
-
-test('bookmarks: chips with safe links only; typing in the search box dims the others', async () => {
-  const profile = tempDir('profile-');
-  makePlaces(profile, [['GitHub', 'https://github.com/'], ['Figma', 'https://figma.com/'], ['Mail', 'https://mail.example/']]);
-  const s = await start({ profile });
-  try {
-    const page = await open(s, { mutateState: (st) => st.bookmarks.push({ title: 'Evil', url: 'javascript:alert(1)' }) });
-    const chips = page.$('links').children;
-    assert.deepEqual(chips.map((c) => c.textContent), ['Figma', 'GitHub', 'Mail'], 'the javascript: link is not rendered');
-    assert.deepEqual(chips.map((c) => c.href), ['https://figma.com/', 'https://github.com/', 'https://mail.example/']);
-    assert.ok(chips.every((c) => c.rel === 'noopener noreferrer'));
-    page.$('q').value = 'fig';
-    page.dispatch(page.$('q'), 'input');
-    assert.deepEqual(chips.map((c) => c.classList.contains('dim')), [false, true, true]);
-    page.$('q').value = '';
-    page.dispatch(page.$('q'), 'input');
-    assert.ok(chips.every((c) => !c.classList.contains('dim')));
-  } finally { s.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
 
 test('keyboard: "/" focuses search, "n" focuses the todo box, Escape leaves, typing does not trigger shortcuts', async () => {

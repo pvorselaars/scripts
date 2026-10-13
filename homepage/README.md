@@ -1,25 +1,26 @@
 # homepage
 
-A start page for the browser: clock, search, your open todos from the notes in `~/Notes`, your
-Firefox bookmarks, and a wallpaper. Ticking a todo writes `[x]` into the note; typing one adds it
-to today's note. No dependencies: Node's standard library only (Node 22 or newer, for `node:sqlite`).
+A minimal start page for the browser: a clock, search, your open todos from the notes in `~/Notes`,
+and a wallpaper. Ticking a todo writes `[x]` into the note; typing one adds it to today's note.
+No dependencies: Node's standard library only.
 
 ```
-10:17                    Friday 23 October
-                         Good morning, Perry
-              [ Search DuckDuckGo or type an address ]
- TODOS (12)                          [Code] [Figma] [GitHub] ...
- [ Add a todo to today's note ]
+            10:17
+   Friday 23 October  ·  Good morning, Perry
+      ________ Search or type an address ________
+
+ Todos (10)
+ ______________ Add a todo ______________
  2026-10-21
   [ ] Itemgroep meerdere keren koppelen ...
-  [x] ...
+  [ ] Performance issue 61 bloksmodel
 ```
 
 ## Run
 
 ```
 npm start                       # http://127.0.0.1:7878
-npm test                        # 40 tests
+npm test                        # the tests
 systemctl --user enable --now homepage.service   # the unit is in the dotfiles repo
 ```
 
@@ -30,7 +31,6 @@ Settings are environment variables, all optional:
 | `HOMEPAGE_PORT` | `7878` | |
 | `NOTES_DIR` | `~/Notes` | flat folder of `.md` notes |
 | `WALLPAPER_DIR` | `~/Pictures/Wallpapers` | jpg, png, webp or avif; one is picked per page load |
-| `FIREFOX_PROFILE` | the most recently used profile | folder containing `places.sqlite` |
 | `HOMEPAGE_NAME` | your user name | used in the greeting |
 
 ## Using it as the new tab page
@@ -53,8 +53,7 @@ If the service is not running the tab shows a connection error: `systemctl --use
 | `n` | focus the "add a todo" box |
 | `Esc` | leave the box |
 
-Typing in the search box dims the bookmarks that do not match. Text that looks like an address
-opens it; anything else is a DuckDuckGo search, so `!yt lofi` and `!gh sway` work. A leading `?`
+Text that looks like an address opens it; anything else is a DuckDuckGo search, so `!yt lofi` and `!gh sway` work. A leading `?`
 forces a search.
 
 ## Todos
@@ -84,10 +83,9 @@ It listens on `127.0.0.1` only and can write to your notes, so it checks every r
 - Note names are limited to `.md` files directly in the notes folder; path tricks and symlinks that
   point elsewhere are refused.
 - The page is built with `textContent`, never `innerHTML`, and served with a strict
-  Content-Security-Policy (no inline scripts or styles, no other origins). Text in a note or a
-  bookmark title cannot inject markup. Only `http(s)` bookmark links are rendered.
+  Content-Security-Policy (no inline scripts or styles, no other origins). Text in a note cannot
+  inject markup.
 - The systemd unit makes everything except `~/Notes` read-only and the service cannot gain privileges.
-- Firefox keeps its bookmark database locked, so it is read from a temporary copy; the original is never touched.
 
 ## Files
 
@@ -97,5 +95,5 @@ public/           index.html, style.css, app.js (the page), lib.js (pure helpers
 test/             node --test: todos, security, data, page logic, and app.js against the real server
 ```
 
-API (all JSON): `GET /api/todos`, `GET /api/bookmarks`, `GET /api/wallpaper`,
+API (all JSON): `GET /api/todos`, `GET /api/wallpaper`,
 `POST /api/todos/toggle` `{file, line, text, done}`, `POST /api/todos/add` `{text}`.

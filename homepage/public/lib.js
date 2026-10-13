@@ -44,10 +44,7 @@
   const formatClock = (date) => `${pad(date.getHours())}:${pad(date.getMinutes())}`;
   const formatDate = (date) => new Intl.DateTimeFormat('en-GB', { weekday: 'long', day: 'numeric', month: 'long' }).format(date);
 
-  // only http(s) links are ever put into an href
-  const safeHref = (url) => (/^https?:\/\//i.test(url) ? url : null);
-
-  const lib = { classifyInput, splitCode, greeting, formatClock, formatDate, safeHref };
+  const lib = { classifyInput, splitCode, greeting, formatClock, formatDate };
   if (typeof module !== 'undefined' && module.exports) module.exports = lib;
   else root.HomepageLib = lib;
 })(typeof self !== 'undefined' ? self : this);

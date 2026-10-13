@@ -3,7 +3,6 @@ const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
-const { DatabaseSync } = require('node:sqlite');
 const { createServer, localDate } = require('../server.js');
 
 const today = localDate();
@@ -11,13 +10,13 @@ const today = localDate();
 function tempDir(prefix = 'homepage-test-') { return fs.mkdtempSync(path.join(os.tmpdir(), prefix)); }
 
 // a notes folder, wallpaper folder and server on an ephemeral port
-async function start({ notes = {}, wallpapers = {}, profile = null } = {}) {
+async function start({ notes = {}, wallpapers = {} } = {}) {
   const notesDir = tempDir('notes-');
   const wallpaperDir = tempDir('wall-');
   for (const [name, content] of Object.entries(notes)) fs.writeFileSync(path.join(notesDir, name), content);
   for (const [name, content] of Object.entries(wallpapers)) fs.writeFileSync(path.join(wallpaperDir, name), content);
   const cfg = {
-    host: '127.0.0.1', port: 0, notesDir, wallpaperDir, firefoxProfile: profile ?? tempDir('profile-'),
+    host: '127.0.0.1', port: 0, notesDir, wallpaperDir,
     name: 'Tester', publicDir: path.join(__dirname, '..', 'public'),
   };
   const server = createServer(cfg);
@@ -49,15 +48,4 @@ function request(port, { method = 'GET', path: p = '/', headers = {}, body } = {
 
 const post = (port, p, body, headers = {}) => request(port, { method: 'POST', path: p, body, headers: { 'Content-Type': 'application/json', ...headers } });
 
-// a minimal Firefox places.sqlite
-function makePlaces(dir, bookmarks) {
-  const db = new DatabaseSync(path.join(dir, 'places.sqlite'));
-  db.exec('CREATE TABLE moz_places (id INTEGER PRIMARY KEY, url TEXT, title TEXT); CREATE TABLE moz_bookmarks (id INTEGER PRIMARY KEY, type INTEGER, fk INTEGER, title TEXT)');
-  bookmarks.forEach(([title, url, type = 1], i) => {
-    db.prepare('INSERT INTO moz_places (id, url, title) VALUES (?, ?, ?)').run(i + 1, url, title);
-    db.prepare('INSERT INTO moz_bookmarks (id, type, fk, title) VALUES (?, ?, ?, ?)').run(i + 1, type, i + 1, title);
-  });
-  db.close();
-}
-
-module.exports = { today, tempDir, start, request, post, makePlaces };
+module.exports = { today, tempDir, start, request, post };
