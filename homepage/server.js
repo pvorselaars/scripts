@@ -32,6 +32,7 @@ function loadConfig(env = process.env) {
     port: Number(env.HOMEPAGE_PORT ?? 7878),
     notesDir: path.resolve(env.NOTES_DIR ?? path.join(home, 'Notes')),
     wallpaperDir: path.resolve(env.WALLPAPER_DIR ?? path.join(home, 'Pictures', 'Wallpapers')),
+    wallpaper: env.HOMEPAGE_WALLPAPER ?? '',
     name: env.HOMEPAGE_NAME ?? user.charAt(0).toUpperCase() + user.slice(1),
     publicDir: path.join(__dirname, 'public'),
   };
@@ -204,10 +205,23 @@ function captionFor(name) {
   return { text: '', credit: '' };
 }
 
+function fnv1a(text) {
+  let hash = 0x811c9dc5;
+  for (const byte of Buffer.from(text)) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+  return hash;
+}
+
+// One background for the whole day, the same on every page, tab and reload (and across a restart).
+// Each image gets a score from "date:filename" and the lowest wins, so adding wallpapers during
+// the day almost never changes the pick (a new file wins 1 time in n). HOMEPAGE_WALLPAPER pins one file.
 function pickWallpaper(cfg) {
-  const all = listWallpapers(cfg);
+  const all = listWallpapers(cfg).sort();
   if (all.length === 0) return null;
-  const name = all[Math.floor(Math.random() * all.length)];
+  let name = cfg.wallpaper && all.includes(cfg.wallpaper) ? cfg.wallpaper : null;
+  if (!name) {
+    const day = localDate(cfg.now ? cfg.now() : new Date());
+    name = all.reduce((best, n) => (fnv1a(`${day}:${n}`) < fnv1a(`${day}:${best}`) ? n : best));
+  }
   return { url: `/wallpaper/${encodeURIComponent(name)}`, ...captionFor(name) };
 }
 

@@ -30,8 +30,16 @@ Settings are environment variables, all optional:
 |---|---|---|
 | `HOMEPAGE_PORT` | `7878` | |
 | `NOTES_DIR` | `~/Notes` | flat folder of `.md` notes |
-| `WALLPAPER_DIR` | `~/Pictures/Wallpapers` | jpg, png, webp or avif; one is picked per page load |
+| `WALLPAPER_DIR` | `~/Pictures/Wallpapers` | jpg, png, webp or avif |
+| `HOMEPAGE_WALLPAPER` | (none) | file name to use as the background every day, instead of the daily pick |
 | `HOMEPAGE_NAME` | your user name | used in the greeting |
+
+## Background
+
+One image, the same on every page, tab and reload: the home page and every note view. It is chosen
+once a day from the wallpaper folder (by the date, so a restart does not change it) and changes at
+midnight. New wallpapers added during the day almost never change the pick. Set
+`HOMEPAGE_WALLPAPER=name.jpg` to keep one image for good.
 
 ## Using it as the new tab page
 
