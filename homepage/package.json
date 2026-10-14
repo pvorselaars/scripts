@@ -1,9 +1,0 @@
-{
-  "name": "homepage",
-  "private": true,
-  "description": "Start page: todos from ~/Notes, Firefox bookmarks, wallpaper. No dependencies.",
-  "scripts": {
-    "start": "node --disable-warning=ExperimentalWarning server.js",
-    "test": "node --disable-warning=ExperimentalWarning --test \"test/*.test.js\""
-  }
-}
