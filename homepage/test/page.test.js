@@ -90,3 +90,22 @@ test('the page code never parses text as HTML and never talks to another site', 
   assert.doesNotMatch(html, /https?:\/\/(?!duckduckgo)/, 'no external resources in the HTML or CSS');
   assert.doesNotMatch(html, /\sstyle=|\son\w+=/i, 'no inline styles or handlers (the CSP forbids them)');
 });
+
+test('inline markup: code, wiki links (alias, heading), http links and bold; code wins over links', () => {
+  assert.deepEqual(lib.splitRich('see [[selios]] now'), [{ text: 'see ' }, { text: 'selios', wiki: { name: 'selios', heading: '' } }, { text: ' now' }]);
+  assert.deepEqual(lib.splitRich('[[Notes#My Head|alias]]'), [{ text: 'alias', wiki: { name: 'Notes', heading: 'My Head' } }]);
+  assert.deepEqual(lib.splitRich('[[ spaced ]]'), [{ text: 'spaced', wiki: { name: 'spaced', heading: '' } }]);
+  assert.deepEqual(lib.splitRich('`[[not a link]]`'), [{ text: '[[not a link]]', code: true }]);
+  assert.deepEqual(lib.splitRich('[docs](https://a.example/x?y=1) **b**'), [{ text: 'docs', href: 'https://a.example/x?y=1' }, { text: ' ' }, { text: 'b', bold: true }]);
+  for (const plain of ['[x](javascript:alert(1))', '[x](data:text/html,y)', '[[unclosed', '[[]]', '[[a]', '**unclosed', '[[a\nb]]']) {
+    assert.ok(lib.splitRich(plain).every((p) => !p.href && !p.wiki), `${JSON.stringify(plain)} stays plain text`);
+  }
+});
+
+test('note links and anchors: encoded, with a heading slug that keeps accents', () => {
+  assert.equal(lib.noteHref('selios'), '/note/selios');
+  assert.equal(lib.noteHref('my note'), '/note/my%20note');
+  assert.equal(lib.noteHref('a/b?c#d'), '/note/a%2Fb%3Fc%23d', 'a name can never add a path segment');
+  assert.equal(lib.noteHref('n', 'My Head!'), '/note/n#my-head');
+  assert.equal(lib.slug('  Héllo, Wörld 2  '), 'héllo-wörld-2');
+});
