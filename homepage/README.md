@@ -63,6 +63,23 @@ Today's note, then daily notes (newest first), then other notes. Ticked todos st
 struck through, until the next reload, so a mis-click is easy to undo. The page refreshes when you
 come back to the tab and every minute, so changes made in nvim show up.
 
+## Wiki links and the note view
+
+`[[selios]]` in a todo is a link to `selios.md` (telekasten style). It opens the **note view** at `/note/selios`:
+the note rendered read-only, with its todos still tickable, and a **Linked from** list of every note
+that links to it, with the line that does. Links to notes that do not exist yet are dimmed and dashed.
+
+| Link | Goes to |
+|---|---|
+| `[[note]]` | `note.md`, found whatever the case (`[[Note]]` works too) |
+| `[[note|alias]]` | the same, shown as *alias* |
+| `[[note#Heading]]` | the same, scrolled to that heading |
+| `[text](https://…)` | an external link (only http and https) |
+
+The note view understands a small subset of markdown: headings, paragraphs, bullet and numbered
+lists, todos, quotes, code blocks, `code`, **bold** and the links above. Everything else is shown as
+plain text. `Esc` goes back to the home page. A note that links to itself is not listed in its own backlinks.
+
 Writing is careful:
 
 - The server re-reads the file and finds the todo by its **text**, not only its line number, so
@@ -81,7 +98,7 @@ It listens on `127.0.0.1` only and can write to your notes, so it checks every r
 - `POST` requests must be `application/json` and, when an `Origin` is sent, from this page. A web
   page on another site cannot send that, and no CORS headers are ever returned.
 - Note names are limited to `.md` files directly in the notes folder; path tricks and symlinks that
-  point elsewhere are refused.
+  point elsewhere are refused, for reading (note view, backlinks, todo list) as well as writing.
 - The page is built with `textContent`, never `innerHTML`, and served with a strict
   Content-Security-Policy (no inline scripts or styles, no other origins). Text in a note cannot
   inject markup.
@@ -92,9 +109,10 @@ It listens on `127.0.0.1` only and can write to your notes, so it checks every r
 
 ```
 server.js         the server and the API
-public/           index.html, style.css, app.js (the page), lib.js (pure helpers, also tested in Node)
+public/           index.html + app.js (home), note.html + note.js (note view), style.css,
+                  lib.js (pure helpers, also tested in Node)
 test/             node --test: todos, security, data, page logic, and app.js against the real server
 ```
 
-API (all JSON): `GET /api/todos`, `GET /api/wallpaper`,
+API (all JSON): `GET /api/todos`, `GET /api/note/NAME`, `GET /api/wallpaper`,
 `POST /api/todos/toggle` `{file, line, text, done}`, `POST /api/todos/add` `{text}`.
