@@ -1,0 +1,37 @@
+# Curated wallpapers: <wallhaven id> <resolution> <subject>. Fetched by fetch-wallpapers.
+8g5qr2 3840x2160 galaxy
+lygg6r 4928x3280 space station
+k88m2m 7680x4320 nebula
+vpzwop 3840x2400 galaxy
+d8eoej 3840x2160 planet
+5y3q31 6144x3456 galaxy
+vp5qg8 6144x3445 galaxy
+5yk9o1 5568x3712 planet
+pojl63 3840x2160 galaxy
+e82xxr 5153x2899 mountains
+vpywv3 4627x2603 forest
+yqvj5g 6144x3456 mountains
+d8ojdm 3840x2160 snow
+lydwyy 5120x2880 forest
+je1qxp 3840x2160 fog
+oggp1m 3840x2160 forest
+3qr8z6 6143x3456 forest
+e83wdk 6144x3458 forest
+e8wejo 5120x2880 ocean
+1qqwq3 5120x2880 forest
+mlz28k 5120x2880 lake
+lyj5gl 3840x2160 night sky
+xedo8v 5120x2880 night sky
+gwwqvq 4032x2268 lake
+gwwwxd 6034x3394 forest
+d8e1ll 5120x2880 ocean
+xee1ko 3840x2160 snow
+gwmo13 3840x2160 lake
+6lwr2x 5120x2880 forest
+zpp5ww 3840x2160 fog
+vp22dm 5272x2962 mountains
+3q5mx9 5120x2880 fog
+ly251q 5120x2880 fog
+xepww3 5120x2880 fog
+xejzlz 5120x2880 fog
+5yyyj5 3840x2160 coast
