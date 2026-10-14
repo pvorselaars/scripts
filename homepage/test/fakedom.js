@@ -34,16 +34,17 @@ class FakeNode {
 }
 class FakeText { constructor(t) { this.tagName = '#text'; this.textContent = t; this.children = []; } }
 
-const IDS = ['clock', 'date', 'greeting', 'search', 'q', 'todos', 'todo-count', 'status', 'add', 'add-text', 'todo-groups', 'credit', 'state', 'bg'];
+const IDS = ['clock', 'date', 'greeting', 'search', 'q', 'todos', 'todo-count', 'status', 'add', 'add-text', 'todo-groups', 'credit', 'state', 'bg',
+  'note-title', 'note', 'backlinks', 'backlink-list', 'home'];
 
 function walk(node, fn) { fn(node); for (const c of node.children ?? []) walk(c, fn); }
 
 // run app.js against `stateJson` (the text of the embedded state block) and a base URL for fetch
-function loadPage({ stateJson, base }) {
+function loadPage({ stateJson, base, script = 'app.js' }) {
   const created = [];
   const timers = [];
   const document = {
-    hidden: false, listeners: {}, byId: {},
+    hidden: false, title: '', listeners: {}, byId: {},
     body: { tagName: 'BODY', blur() {} },
     getElementById(id) { return this.byId[id]; },
     createElement(tag) { const n = new FakeNode(tag); n.ownerDocument = this; created.push(n); return n; },
@@ -51,12 +52,12 @@ function loadPage({ stateJson, base }) {
     addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn); },
   };
   document.activeElement = document.body;
-  const TAGS = { q: 'input', 'add-text': 'input', search: 'form', add: 'form' };
+  const TAGS = { q: 'input', 'add-text': 'input', search: 'form', add: 'form', backlinks: 'section' };
   for (const id of IDS) { const n = new FakeNode(TAGS[id] ?? 'div'); n.ownerDocument = document; document.byId[id] = n; }
   document.byId.state.textContent = stateJson;
 
   const context = vm.createContext({
-    document, window: { location: { href: 'http://127.0.0.1/' } },
+    document, window: { location: { href: 'http://127.0.0.1/', hash: '' } },
     fetch: (p, opts) => fetch(base + p, opts),
     setInterval: (fn, ms) => timers.push({ fn, ms }), setTimeout: (fn, ms) => timers.push({ fn, ms }),
     JSON, Set, Intl, Date, Promise, console, Image: class {},
@@ -64,7 +65,7 @@ function loadPage({ stateJson, base }) {
   const dir = path.join(__dirname, '..', 'public');
   vm.runInContext(fs.readFileSync(path.join(dir, 'lib.js'), 'utf8'), context);
   context.HomepageLib = context.HomepageLib ?? vm.runInContext('HomepageLib', context);
-  vm.runInContext(fs.readFileSync(path.join(dir, 'app.js'), 'utf8'), context);
+  vm.runInContext(fs.readFileSync(path.join(dir, script), 'utf8'), context);
 
   const $ = (id) => document.byId[id];
   const dispatch = (node, type, event = {}) => { for (const fn of node.listeners[type] ?? []) fn({ preventDefault() {}, ...event }); };

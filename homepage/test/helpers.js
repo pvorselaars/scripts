@@ -7,6 +7,9 @@ const { createServer, localDate } = require('../server.js');
 
 const today = localDate();
 
+// unique even when test files run in parallel in the same temp folder
+const unique = (prefix) => `${prefix}-${process.pid}-${Math.random().toString(36).slice(2)}`;
+
 function tempDir(prefix = 'homepage-test-') { return fs.mkdtempSync(path.join(os.tmpdir(), prefix)); }
 
 // a notes folder, wallpaper folder and server on an ephemeral port
@@ -48,4 +51,4 @@ function request(port, { method = 'GET', path: p = '/', headers = {}, body } = {
 
 const post = (port, p, body, headers = {}) => request(port, { method: 'POST', path: p, body, headers: { 'Content-Type': 'application/json', ...headers } });
 
-module.exports = { today, tempDir, start, request, post };
+module.exports = { today, tempDir, unique, start, request, post };

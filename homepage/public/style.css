@@ -74,6 +74,38 @@ li.done .text { color: var(--dim); text-decoration: line-through; text-decoratio
 code { font-family: ui-monospace, "JetBrains Mono", monospace; font-size: 0.9em; color: var(--bright); }
 .empty { margin: 0; color: var(--dim); }
 
+/* links */
+a.wiki, a.ext { color: var(--text); text-decoration: underline; text-decoration-color: var(--faint); text-underline-offset: 3px; }
+a.wiki { text-decoration-color: var(--accent); }
+a.wiki:hover, a.ext:hover { color: var(--bright); }
+a.wiki.missing { color: var(--dim); text-decoration-style: dashed; text-decoration-color: var(--faint); }
+a:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+
+/* the note view */
+/* more text on this page, so a darker veil over the wallpaper */
+body:has(.note-main) #dim { background: rgba(14, 16, 19, 0.88); }
+.note-main { align-items: stretch; gap: 20px; padding-top: 8vh; max-width: 680px; }
+.note-main nav a { color: var(--dim); text-decoration: none; }
+.note-main nav a:hover { color: var(--bright); }
+.note-main h1 { margin: 8px 0 0; font-size: 28px; font-weight: 300; color: var(--bright); letter-spacing: -0.01em; }
+#note h2, #note h3, #note h4, #note h5 { margin: 28px 0 8px; font-weight: 500; color: var(--bright); line-height: 1.3; }
+#note h2 { font-size: 20px; }
+#note h3 { font-size: 17px; }
+#note h4, #note h5 { font-size: 15px; }
+#note p { margin: 0 0 12px; }
+#note ul, #note ol { margin: 0 0 12px; padding-left: 0; }
+#note ol { list-style: decimal inside; }
+#note li { padding-left: calc(var(--indent, 0) * 20px); }
+#note ul li:not(:has(label))::before { content: "–"; color: var(--dim); margin-right: 10px; }
+#note blockquote { margin: 0 0 12px; padding-left: 14px; border-left: 1px solid var(--faint); color: var(--dim); }
+#note pre { margin: 0 0 14px; padding: 10px 12px; overflow-x: auto; background: rgba(14, 16, 19, 0.45); }
+#note pre code { color: var(--text); }
+#backlinks { margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--faint); }
+#backlinks ul { margin: 6px 0 0; }
+#backlinks li { padding: 3px 0; display: flex; gap: 12px; align-items: baseline; }
+.snippet { color: var(--dim); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+
+
 input[type="checkbox"] {
   appearance: none; flex: none; width: 13px; height: 13px; margin: 0; position: relative; top: 2px;
   border: 1px solid var(--dim); background: transparent; border-radius: 0; cursor: pointer;

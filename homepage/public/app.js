@@ -3,7 +3,7 @@
 (function () {
   'use strict';
 
-  const { classifyInput, splitCode, greeting, formatClock, formatDate } = HomepageLib;
+  const { classifyInput, renderInline, greeting, formatClock, formatDate } = HomepageLib;
   const state = JSON.parse(document.getElementById('state').textContent);
   const $ = (id) => document.getElementById(id);
   const el = (tag, className, text) => {
@@ -79,7 +79,10 @@
     }
   }
 
-  function renderTodo(note, todo) {
+  // lower-case names of every note, so a [[link]] to a note that does not exist yet can look different
+  const noteNames = () => new Set((state.todos.names || []).map((n) => n.toLowerCase()));
+
+  function renderTodo(note, todo, names) {
     const item = el('li', todo.done ? 'done' : '');
     item.style.setProperty('--indent', String(todo.indent));
     const label = el('label');
@@ -88,7 +91,7 @@
     checkbox.checked = todo.done;
     checkbox.addEventListener('change', () => toggle(note, todo, checkbox, item));
     const text = el('span', 'text');
-    for (const part of splitCode(todo.text)) text.append(part.code ? el('code', '', part.text) : document.createTextNode(part.text));
+    renderInline(document, text, todo.text, names);
     label.append(checkbox, text);
     item.append(label);
     return item;
@@ -98,13 +101,14 @@
     const root = $('todo-groups');
     root.replaceChildren();
     let shown = 0;
+    const names = noteNames();
     for (const note of state.todos.notes) {
       const todos = visibleTodos(note);
       if (todos.length === 0 && note.kind !== 'today') continue;
       const group = el('section', 'group');
       group.append(el('h3', note.kind === 'today' ? 'today' : '', groupLabel(note)));
       const list = el('ul');
-      for (const todo of todos) { list.append(renderTodo(note, todo)); shown += 1; }
+      for (const todo of todos) { list.append(renderTodo(note, todo, names)); shown += 1; }
       group.append(list);
       root.append(group);
     }

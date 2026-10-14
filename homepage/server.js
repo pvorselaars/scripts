@@ -18,7 +18,7 @@ const MIME = {
   '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
   '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.avif': 'image/avif',
 };
-const STATIC_FILES = new Set(['style.css', 'app.js', 'lib.js']);
+const STATIC_FILES = new Set(['style.css', 'app.js', 'note.js', 'lib.js']);
 
 class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -65,24 +65,72 @@ function parseTodos(content) {
   return todos;
 }
 
+// The notes: .md files that are real files directly inside the notes folder. A symlink that points
+// outside the folder is not a note (it must not be readable through the page either).
+async function noteFiles(cfg) {
+  let root;
+  let entries;
+  try { root = await fsp.realpath(cfg.notesDir); entries = await fsp.readdir(cfg.notesDir); } catch { return []; }
+  const out = [];
+  for (const file of entries) {
+    if (!file.endsWith('.md') || file.startsWith('.')) continue;
+    let real;
+    try { real = await fsp.realpath(path.join(cfg.notesDir, file)); } catch { continue; }
+    if (path.dirname(real) !== root) continue;
+    const stat = await fsp.stat(real);
+    if (stat.isFile()) out.push({ file, name: file.slice(0, -3), full: real, mtime: stat.mtimeMs });
+  }
+  return out;
+}
+
+const noteRank = (name, today) => (name === today ? 0 : /^\d{4}-\d{2}-\d{2}$/.test(name) ? 1 : 2);
+
 async function listTodos(cfg) {
   const today = localDate();
-  let names = [];
-  try { names = (await fsp.readdir(cfg.notesDir)).filter((n) => n.endsWith('.md') && !n.startsWith('.')); } catch { /* no notes yet */ }
+  const files = await noteFiles(cfg);
   const notes = [];
-  for (const file of names) {
-    const full = path.join(cfg.notesDir, file);
-    const stat = await fsp.stat(full);
-    if (!stat.isFile()) continue;
+  for (const { file, name, full, mtime } of files) {
     const todos = parseTodos(await fsp.readFile(full, 'utf8'));
     if (todos.length === 0) continue;
-    const title = file.replace(/\.md$/, '');
-    const kind = title === today ? 'today' : /^\d{4}-\d{2}-\d{2}$/.test(title) ? 'daily' : 'note';
-    notes.push({ file, title, kind, mtime: stat.mtimeMs, todos });
+    const kind = ['today', 'daily', 'note'][noteRank(name, today)];
+    notes.push({ file, title: name, kind, mtime, todos });
   }
   const rank = { today: 0, daily: 1, note: 2 };
   notes.sort((a, b) => rank[a.kind] - rank[b.kind] || (a.kind === 'note' ? b.mtime - a.mtime : b.title.localeCompare(a.title)));
-  return { today, notes: notes.map(({ mtime, ...n }) => n) };
+  // names: every note, so [[links]] to notes that do not exist yet can be shown differently
+  return { today, notes: notes.map(({ mtime, ...n }) => n), names: files.map((f) => f.name).sort() };
+}
+
+// ---- one note, and what links to it ------------------------------------------------------------
+
+const WIKI_LINK = /\[\[([^\]\n|#]+?)(?:#[^\]\n|]+)?(?:\|[^\]\n]+)?\]\]/g;
+const MAX_NOTE_BYTES = 1_000_000;
+
+async function noteInfo(cfg, requested) {
+  if (typeof requested !== 'string' || !/^[^/\\\0]{1,200}$/.test(requested) || requested.startsWith('.')) throw new HttpError(400, 'invalid note name');
+  const today = localDate();
+  const files = await noteFiles(cfg);
+  // [[Selios]] finds selios.md; an exact match wins over a case-insensitive one
+  const hit = files.find((f) => f.name === requested) ?? files.find((f) => f.name.toLowerCase() === requested.toLowerCase());
+  const target = (hit?.name ?? requested).toLowerCase();
+
+  const backlinks = [];
+  for (const f of files) {
+    if (hit && f.name === hit.name) continue;
+    const snippets = [];
+    for (const line of (await fsp.readFile(f.full, 'utf8')).split('\n')) {
+      WIKI_LINK.lastIndex = 0;
+      for (let m = WIKI_LINK.exec(line); m; m = WIKI_LINK.exec(line)) {
+        if (m[1].trim().toLowerCase() === target) { snippets.push(line.trim().slice(0, 160)); break; }
+      }
+    }
+    if (snippets.length) backlinks.push({ name: f.name, snippets: snippets.slice(0, 3) });
+  }
+  backlinks.sort((a, b) => noteRank(a.name, today) - noteRank(b.name, today) || (noteRank(a.name, today) === 1 ? b.name.localeCompare(a.name) : a.name.localeCompare(b.name)));
+
+  let content = null;
+  if (hit) content = (await fsp.readFile(hit.full, 'utf8')).slice(0, MAX_NOTE_BYTES);
+  return { exists: Boolean(hit), name: hit?.name ?? requested, file: hit?.file ?? null, content, backlinks, names: files.map((f) => f.name).sort() };
 }
 
 async function writeAtomically(file, content, mode) {
@@ -211,13 +259,20 @@ function createServer(cfg) {
         if (origin && !allowedOrigins.has(origin)) throw new HttpError(403, 'forbidden origin');
       }
 
-      if (route === 'GET /') {
-        const html = await fsp.readFile(path.join(cfg.publicDir, 'index.html'), 'utf8');
-        const state = { name: cfg.name, todos: await listTodos(cfg), wallpaper: pickWallpaper(cfg) };
+      const page = async (file, extra) => {
+        const html = await fsp.readFile(path.join(cfg.publicDir, file), 'utf8');
+        const state = { name: cfg.name, wallpaper: pickWallpaper(cfg), ...extra };
         const picture = state.wallpaper ? `<img id="bg" alt="" src="${escapeAttr(state.wallpaper.url)}">` : '';
         return send(res, 200, html.replace('<!--WALLPAPER-->', () => picture).replace('__STATE__', () => embed(state)),
           { 'Content-Type': MIME['.html'], 'Cache-Control': 'no-store', 'Content-Security-Policy': CSP });
-      }
+      };
+      const noteName = (prefix) => {
+        try { return decodeURIComponent(url.pathname.slice(prefix.length)); } catch { throw new HttpError(400, 'invalid note name'); }
+      };
+
+      if (route === 'GET /') return await page('index.html', { todos: await listTodos(cfg) });
+      if (req.method === 'GET' && url.pathname.startsWith('/note/')) return await page('note.html', { note: await noteInfo(cfg, noteName('/note/')) });
+      if (req.method === 'GET' && url.pathname.startsWith('/api/note/')) return sendJson(res, 200, await noteInfo(cfg, noteName('/api/note/')));
       if (req.method === 'GET' && STATIC_FILES.has(url.pathname.slice(1))) {
         const file = path.join(cfg.publicDir, url.pathname.slice(1));
         return send(res, 200, await fsp.readFile(file), { 'Content-Type': MIME[path.extname(file)], 'Cache-Control': 'no-cache' });

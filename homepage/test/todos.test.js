@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { start, request, post, today } = require('./helpers.js');
+const { start, request, post, today, unique } = require('./helpers.js');
 
 const NOTE = '- [ ] first\n- [x] done one\nplain text\n- [ ] third `code`\n';
 
@@ -93,7 +93,7 @@ test('toggle only touches .md files directly inside the notes folder', async () 
   try {
     fs.mkdirSync(path.join(s.notesDir, 'sub'));
     fs.writeFileSync(path.join(s.notesDir, 'sub', 'b.md'), '- [ ] nested\n');
-    const outside = path.join(s.notesDir, '..', `outside-${Date.now()}.md`);
+    const outside = path.join(s.notesDir, '..', `${unique('outside')}.md`);
     fs.writeFileSync(outside, '- [ ] outside\n');
     fs.symlinkSync(outside, path.join(s.notesDir, 'link.md'));
     const attempts = ['../etc/passwd', '../../x.md', 'sub/b.md', '/etc/passwd', 'secret.txt', '.hidden.md', 'a.md\0', 'link.md', ''];

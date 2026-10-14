@@ -85,12 +85,16 @@ test('adding a todo appends it to today\'s note and shows it under Today', async
 });
 
 test('hostile todo text is shown as text, never as elements', async () => {
-  const evil = '<img src=x onerror=alert(1)> <script>alert(2)</script> [[link]]';
-  const s = await start({ notes: { 'x.md': `- [ ] ${evil}\n` } });
+  const evil = '<img src=x onerror=alert(1)> <script>alert(2)</script>';
+  const s = await start({ notes: { 'x.md': `- [ ] ${evil} [[link]]\n` } });
   try {
     const page = await open(s);
     assert.ok(page.find(page.$('todo-groups'), (n) => n.textContent.includes(evil)).length > 0, 'the text is shown');
-    assert.deepEqual(page.created.map((n) => n.tagName).filter((t) => ['IMG', 'SCRIPT', 'IFRAME', 'A'].includes(t)), []);
+    assert.deepEqual(page.created.map((n) => n.tagName).filter((t) => ['IMG', 'SCRIPT', 'IFRAME'].includes(t)), []);
+    // the [[link]] next to the hostile text is the one and only link: a plain, safe <a>
+    const links = page.created.filter((n) => n.tagName === 'A');
+    assert.equal(links.length, 1);
+    assert.deepEqual([links[0].href, links[0].textContent, links[0].className], ['/note/link', 'link', 'wiki missing']);
     page.$('add-text').value = evil;
     page.dispatch(page.$('add'), 'submit');
     await page.waitFor(() => page.$('add-text').value === '');
@@ -140,5 +144,15 @@ test('the page keeps itself fresh: refetches todos when the tab becomes visible'
     page.document.hidden = false;
     page.document.listeners.visibilitychange.forEach((fn) => fn({}));
     await page.waitFor(() => page.$('todo-count').textContent === '(4)');
+  } finally { s.close(); }
+});
+
+test('wiki links in a todo: to an existing note, to a missing note, with an alias', async () => {
+  const s = await start({ notes: { 'selios.md': 'x\n', '2026-10-02.md': '- [ ] mail [[selios]] and [[ghost]] and [[Selios#Plan|the plan]]\n' } });
+  try {
+    const page = await open(s);
+    const links = page.find(page.$('todo-groups'), (n) => n.tagName === 'A').map((a) => [a.textContent, a.href, a.className]);
+    assert.deepEqual(links, [['selios', '/note/selios', 'wiki'], ['ghost', '/note/ghost', 'wiki missing'], ['the plan', '/note/Selios#plan', 'wiki']]);
+    assert.match(page.find(page.$('todo-groups'), (n) => n.tagName === 'LABEL')[0].textContent, /^mail selios and ghost and the plan$/);
   } finally { s.close(); }
 });
