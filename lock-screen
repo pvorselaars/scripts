@@ -1,23 +1,15 @@
 #!/bin/sh
-# Lock the screen with a blurred, darkened snapshot of what was on it. Does nothing if it is already
-# locked, so triggers can overlap safely (idle timeout, sleep, loginctl lock-session, $mod+Escape).
-# Colours: One Dark Darker, same as the sway config. The ring only appears while typing.
+# Lock the screen (swaylock-effects) over a blurred, dimmed snapshot of what was on it, with a clock.
+# Does nothing if it is already locked, so triggers can overlap safely
+# (idle timeout, sleep, loginctl lock-session, $mod+Escape).
+# Colours: One Dark Darker, same as the sway config.
 pgrep -x swaylock >/dev/null && exit 0
-
-dir=${XDG_RUNTIME_DIR:-/tmp}/lock-screen
-mkdir -p "$dir"
-images=""
-for out in $(swaymsg -t get_outputs -r | jq -r '.[] | select(.active) | .name'); do
-    # grab at a quarter of the size: blurring that is fast, and scaled back up it is smooth anyway
-    if grim -s 0.25 -o "$out" "$dir/$out.png" 2>/dev/null &&
-       magick "$dir/$out.png" -virtual-pixel edge -blur 0x4 -modulate 55,80 -fill '#1f2329' -colorize 25% -resize 400% "$dir/$out.png" 2>/dev/null; then
-        images="$images -i $out:$dir/$out.png"
-    fi
-done
-
-# shellcheck disable=SC2086
-exec swaylock -f -c 1f2329 $images --scaling fill \
-    --font "JetBrains Mono" --font-size 22 --indicator-radius 70 --indicator-thickness 4 \
+exec swaylock -f -c 1f2329 --screenshots \
+    --effect-scale 0.25 --effect-blur 6x3 --effect-scale 4 --effect-vignette 0.2:0.9 \
+    --fade-in 0.2 \
+    --clock --timestr '%H:%M' --datestr '%A %-d %B' \
+    --font "JetBrains Mono" --font-size 28 \
+    --indicator --indicator-idle-visible --indicator-radius 90 --indicator-thickness 3 \
     --inside-color 00000000 --inside-clear-color 00000000 --inside-caps-lock-color 00000000 \
     --inside-ver-color 00000000 --inside-wrong-color 00000000 \
     --ring-color 30363f --ring-clear-color e5c07b --ring-caps-lock-color e5c07b \
