@@ -1,4 +1,4 @@
-# Curated wallpapers: <wallhaven id> <resolution> <subject>. Fetched by fetch-wallpapers.
+# Curated wallpapers. "<wallhaven id> <resolution> <subject>" or "commons:<File:Name on Wikimedia Commons>" (public domain). Fetched by fetch-wallpapers.
 8g5qr2 3840x2160 galaxy
 lygg6r 4928x3280 space station
 k88m2m 7680x4320 nebula
@@ -35,3 +35,17 @@ ly251q 5120x2880 fog
 xepww3 5120x2880 fog
 xejzlz 5120x2880 fog
 5yyyj5 3840x2160 coast
+3kmzx6 - spacex booster landing
+1j61p1 - spacex falcon heavy launch
+commons:File:45th Space Wing Supports Successful Falcon 9 SAOCOM 1B Launch 02.jpg
+commons:File:Falcon 9 B1060 Final Flight.jpg
+commons:File:Falcon 9 ONEWEB Launch (7805965).jpg
+commons:File:Falcon 9 Starlink 6-37 Launch (8198777).jpg
+commons:File:Falcon 9 Starlink 6-38 Launch (8215015).jpg
+commons:File:Falcon 9 Starlink 6-45 Launch (8316286).jpg
+commons:File:Falcon 9 Starlink 8-10 Launch (8623019).jpg
+commons:File:Falcon 9 Starlink 8-10 Launch (8623020).jpg
+commons:File:Falcon 9 Starlink 8-6 Launch (8616999).jpg
+commons:File:Space Launch Delta 45 Supports Successful Falcon 9 COSMO-SkyMed Launch (220131-F-KD758-192).jpg
+commons:File:Space Launch Delta 45 Supports Successful Falcon 9 COSMO-SkyMed Launch (220131-F-KD758-316).jpg
+commons:File:Falcon 9 Starlink 8-10 Launch (8623021).jpg

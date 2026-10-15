@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Download the curated wallpapers listed in wallpapers.txt into ~/Pictures/Wallpapers.
 # Usage: fetch-wallpapers
+# Sources: wallhaven ids and Wikimedia Commons files.
 # Images are scaled down to at most 3840 px wide; existing files are skipped.
 set -u
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
@@ -9,18 +10,31 @@ LIST="$here/wallpapers.txt"
 UA="Mozilla/5.0 fetch-wallpapers"
 mkdir -p "$DIR"
 
-grep -v '^#' "$LIST" | while read -r id _; do
-    out="$DIR/$id.jpg"
-    [ -s "$out" ] && continue
-    # the API gives the real file path (and extension) for an id
-    url=$(curl -fsS -m 20 -A "$UA" "https://wallhaven.cc/api/v1/w/$id" | jq -r '.data.path') || { echo "  ! $id: lookup failed"; continue; }
+fetch() { # out-file source-url
     tmp=$(mktemp "$DIR/.part-XXXXXX")
-    if curl -fsSL -m 120 -A "$UA" -o "$tmp" "$url" && file -b --mime-type "$tmp" | grep -q '^image/'; then
-        magick "$tmp" -resize '3840x>' -quality 90 "$out" && echo "  + $id"
+    if curl -fsSL -m 180 -A "$UA" -o "$tmp" "$2" && file -b --mime-type "$tmp" | grep -q '^image/'; then
+        magick "$tmp" -resize '3840x>' -quality 90 "$1" && echo "  + $(basename "$1")"
     else
-        echo "  ! $id: download failed"
+        echo "  ! $(basename "$1"): download failed"
     fi
     rm -f "$tmp"
-    sleep 0.5
+    sleep 3
+}
+
+grep -v '^#' "$LIST" | while IFS= read -r line; do
+    case $line in
+    commons:*)
+        title=${line#commons:}; title=${title#File:}
+        out="$DIR/$(printf '%s' "${title%.*}" | tr -c 'A-Za-z0-9\n' '-' | tr -s '-' | tr 'A-Z' 'a-z' | sed 's/^-//; s/-$//').jpg"
+        [ -s "$out" ] || fetch "$out" "https://commons.wikimedia.org/wiki/Special:FilePath/$(printf '%s' "$title" | tr ' ' '_' | jq -sRr @uri)"
+        ;;
+    *)
+        id=${line%% *}; out="$DIR/$id.jpg"
+        [ -s "$out" ] && continue
+        # the API gives the real file path (and extension) for an id
+        url=$(curl -fsS -m 20 -A "$UA" "https://wallhaven.cc/api/v1/w/$id" | jq -r '.data.path') || { echo "  ! $id: lookup failed"; continue; }
+        fetch "$out" "$url"
+        ;;
+    esac
 done
 echo "done: $(find "$DIR" -maxdepth 1 -type f | wc -l) wallpapers in $DIR"
