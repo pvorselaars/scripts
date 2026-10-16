@@ -18,4 +18,4 @@ choice=$({ mark power-saver '󰌪 power-saver'; mark balanced '󰾅 balanced'; m
     fuzzel --dmenu --prompt 'profile> ' --lines 3 --width 24) || exit 0
 
 name=$(printf '%s' "$choice" | sed 's/^[^ ]* //; s/ .*//')
-[ -n "$name" ] && set_profile "$name" && notify-send -t 2000 "Power profile" "$name"
+[ -n "$name" ] && set_profile "$name" && { notify-send -t 2000 "Power profile" "$name"; ~/.local/bin/statusbar-refresh; }
