@@ -1,15 +1,31 @@
 #!/bin/sh
-# Called by sway on lid events: lid-handler close|open
-# Docked (an external display is active): just turn the laptop panel off and keep working.
+# Called by sway on lid events: lid-handler close|open, and by kanshi after docking: lid-handler sync
+# Docked (an external display is active): turn the laptop panel off and keep working.
 # Undocked: do nothing here; logind suspends and swayidle locks before sleep.
-INTERNAL=eDP-1
+# Output profiles come from kanshi when it runs; otherwise the panel is switched directly.
+INTERNAL=${INTERNAL:-eDP-1}
+
+docked() {
+    [ "$(swaymsg -t get_outputs -r | jq --arg i "$INTERNAL" '[.[] | select(.name != $i)] | length')" -gt 0 ]
+}
+
+close_lid() {
+    docked || return
+    kanshictl switch docked-closed 2>/dev/null || swaymsg output "$INTERNAL" disable >/dev/null
+}
+
+open_lid() {
+    if docked; then
+        kanshictl switch docked 2>/dev/null || swaymsg output "$INTERNAL" enable >/dev/null
+    else
+        kanshictl switch laptop 2>/dev/null || swaymsg output "$INTERNAL" enable >/dev/null
+    fi
+}
+
 case "$1" in
-    close)
-        external=$(swaymsg -t get_outputs -r | jq --arg i "$INTERNAL" '[.[] | select(.active and .name != $i)] | length')
-        [ "$external" -gt 0 ] && swaymsg output "$INTERNAL" disable >/dev/null
-        ;;
-    open)
-        swaymsg output "$INTERNAL" enable >/dev/null
-        ;;
+    close) close_lid ;;
+    open)  open_lid ;;
+    sync)  # after a profile put the panel back on: honour a closed lid
+        grep -qs closed /proc/acpi/button/lid/*/state && close_lid ;;
 esac
 exit 0
