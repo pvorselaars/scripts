@@ -1,7 +1,7 @@
 #!/bin/bash
 # swaybar status line. Modules that only matter sometimes stay hidden until they do:
 #   the playing track, do-not-disturb, cpu/ram/disk when high, battery when low, brightness and volume for a few seconds
-#   after a change, network when there is traffic, bluetooth while a device is connected,
+#   after a change, a power profile icon unless it is balanced, network when there is traffic, bluetooth while a device is connected,
 #   wifi only while offline.
 # Send SIGUSR1 (see statusbar-refresh) to redraw immediately.
 # `statusbar-refresh all` shows every module for a few seconds (toggle).
@@ -154,6 +154,16 @@ net() {
     fi
 }
 
+profile() {
+    local p
+    p=$(busctl --system get-property net.hadess.PowerProfiles /net/hadess/PowerProfiles net.hadess.PowerProfiles ActiveProfile 2>/dev/null | cut -d'"' -f2)
+    case $p in
+        power-saver) paint "$GREEN" "󰌪" ;;
+        performance) paint "$ORANGE" "󰓅" ;;
+        balanced)    [ "$all" = 1 ] && paint "$DIM" "󰾅" ;;
+    esac
+}
+
 battery() {
     local out pct
     out=$("$HOME/Projects/scripts/battery") || return
@@ -216,7 +226,7 @@ while :; do
         if [ "$(date +%s)" -lt "$(cat "$showall_file")" ]; then all=1; else rm -f "$showall_file"; fi
     fi
     parts=()
-    for m in media cpu mem disk net brightness bluetooth wifi volume dnd battery; do
+    for m in media cpu mem disk net brightness bluetooth wifi volume dnd profile battery; do
         res=""
         $m
         [ -n "$res" ] && parts+=("$res")
