@@ -1,6 +1,6 @@
 #!/bin/bash
 # swaybar status line. Modules that only matter sometimes stay hidden until they do:
-#   the playing track, do-not-disturb, cpu/ram/disk when high, battery when low, brightness and volume for a few seconds
+#   REC while recording, a presentation icon in presentation mode, the playing track, do-not-disturb, cpu/ram/disk when high, battery when low, brightness and volume for a few seconds
 #   after a change, a power profile icon unless it is balanced, network when there is traffic, bluetooth while a device is connected,
 #   wifi only while offline.
 # Send SIGUSR1 (see statusbar-refresh) to redraw immediately.
@@ -89,6 +89,14 @@ media() {
     esc "$text"; text=$REPLY
     icon=󰎆; [ "$status" = Paused ] && icon=󰏤
     paint "$ORANGE" "$icon $text"
+}
+
+rec() {
+    pgrep -x wf-recorder >/dev/null && paint "$RED" "󰑊 REC"
+}
+
+pres() {
+    [ -f "${XDG_RUNTIME_DIR:-/tmp}/presentation.mode" ] && paint "$ORANGE" "󰐨"
 }
 
 dnd() {
@@ -220,13 +228,14 @@ volume() {
 }
 
 while :; do
+    echo $$ > "$pidfile"   # self-heal: another instance's exit (e.g. a reload) may have removed it
     poke=0
     all=0
     if [ -f "$showall_file" ]; then
         if [ "$(date +%s)" -lt "$(cat "$showall_file")" ]; then all=1; else rm -f "$showall_file"; fi
     fi
     parts=()
-    for m in media cpu mem disk net brightness bluetooth wifi volume dnd profile battery; do
+    for m in rec pres cpu mem disk net brightness bluetooth wifi volume dnd profile battery media; do
         res=""
         $m
         [ -n "$res" ] && parts+=("$res")
@@ -234,7 +243,9 @@ while :; do
     printf -v res '<span foreground="%s">󰃭</span> %s  <span foreground="%s">󰅐</span> %s' "$DIM" "$(date '+%a %d %b')" "$DIM" "$(date '+%H:%M')"
     parts+=("$res")
     line=${parts[0]}
-    for p in "${parts[@]:1}"; do line+="  $p"; done
+    # the gap is its own span: plain spaces between two icons are drawn from the symbols font, where a space is a dot
+    gap='<span font_family="JetBrains Mono">  </span>'
+    for p in "${parts[@]:1}"; do line+="$gap$p"; done
     printf '%s\n' "$line"
 
     # a signal arrived while we were drawing: draw again right away

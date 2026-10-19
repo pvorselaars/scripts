@@ -10,5 +10,6 @@ if [ "$1" = all ]; then
         echo $((now + 6)) > "$f"
     fi
 fi
-kill -USR1 "$(cat "${XDG_RUNTIME_DIR:-/tmp}/statusbar.pid" 2>/dev/null)" 2>/dev/null
+kill -USR1 "$(cat "${XDG_RUNTIME_DIR:-/tmp}/statusbar.pid" 2>/dev/null)" 2>/dev/null ||
+    pkill -o -USR1 -xf "/bin/bash $HOME/.local/bin/statusbar"   # pidfile missing or stale
 exit 0
