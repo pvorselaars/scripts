@@ -1,0 +1,59 @@
+#!/bin/bash
+# bib-add [--yes] [--dry-run] ISBN [keywords...]: look a book up on Open Library and add it to `references`.
+# Works from anywhere; the bibliography project is ~/Projects/bibliography (override with $BIBLIOGRAPHY).
+# Shows the entry first and asks before appending (--yes skips the question, --dry-run only shows it).
+# %K is the keywords you give, or the title in lower case. Then refer2bib regenerates references.bib.
+here=${BIBLIOGRAPHY:-$HOME/Projects/bibliography}   # the project with `references` and refer2bib
+refs="$here/references"
+
+yes=0; dry=0
+while [[ ${1:-} == --* ]]; do
+    case $1 in
+        --yes) yes=1 ;;
+        --dry-run) dry=1 ;;
+        *) echo "bib-add: unknown option $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+[ $# -ge 1 ] || { echo "usage: bib-add [--yes] [--dry-run] ISBN [keywords...]" >&2; exit 2; }
+
+isbn=${1//[- ]/}; shift
+[[ $isbn =~ ^([0-9]{9}[0-9Xx]|[0-9]{13})$ ]] || { echo "bib-add: '$isbn' is not an ISBN-10 or ISBN-13" >&2; exit 2; }
+keywords="$*"
+
+json=$(curl -fsS -m 15 "https://openlibrary.org/api/books?bibkeys=ISBN:$isbn&format=json&jscmd=data") \
+    || { echo "bib-add: could not reach Open Library" >&2; exit 1; }
+[ "$(jq -r --arg k "ISBN:$isbn" 'has($k)' <<< "$json")" = true ] \
+    || { echo "bib-add: Open Library does not know ISBN $isbn" >&2; exit 1; }
+
+entry=$(jq -r --arg k "ISBN:$isbn" --arg kw "$keywords" '
+    .[$k] as $b
+    | ($b.title + (if $b.subtitle then ": " + $b.subtitle else "" end)) as $title
+    | [ "%K " + (if $kw != "" then $kw else ($title | ascii_downcase) end) ]
+      + [ ($b.authors // [])[] | "%A " + .name ]
+      + [ "%T " + $title ]
+      + (if ($b.publishers // []) | length > 0 then ["%I " + $b.publishers[0].name] else [] end)
+      + (if ($b.publish_places // []) | length > 0 then ["%C " + $b.publish_places[0].name] else [] end)
+      + (if ($b.publish_date // "") | test("[0-9]{4}") then ["%D " + ($b.publish_date | capture("(?<y>[0-9]{4})").y)] else [] end)
+    | .[]' <<< "$json")
+
+echo "$entry"
+echo
+title=$(sed -n 's/^%T //p' <<< "$entry")
+if grep -qixF "%T $title" "$refs"; then
+    echo "bib-add: '$title' is already in references" >&2
+    exit 1
+fi
+grep -q '^%A ' <<< "$entry" || echo "bib-add: note: no author found, refer2bib will use the publisher" >&2
+grep -q '^%D ' <<< "$entry" || echo "bib-add: note: no year found, add a %D line by hand" >&2
+
+[ "$dry" = 1 ] && exit 0
+if [ "$yes" != 1 ]; then
+    read -r -p "Append to references? [y/N] " answer
+    [[ $answer == [yY]* ]] || { echo "not added"; exit 0; }
+fi
+
+[ -n "$(tail -c1 "$refs")" ] && echo >> "$refs"
+{ echo; echo "$entry"; } >> "$refs"
+"$here/refer2bib" 2>&1 | grep -v "note:" | tail -3
+echo "added; the new key is $(grep -o '^@[a-z]*{[^,]*' "$here/references.bib" | tail -1 | sed 's/.*{//')"
