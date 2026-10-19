@@ -13,7 +13,8 @@ while true; do
     img=$(find "$DIR" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | shuf -n 1)
     if [ -n "$img" ]; then
         # persisted so a sway reload re-applies the current wallpaper (included from the sway config)
-        printf 'output * bg "%s" fill\n' "$img" > "$CONF"
+        # the fallback colour makes a deleted image non-fatal: without it sway refuses to load the config
+        printf 'output * bg "%s" fill #1f2329\n' "$img" > "$CONF"
         swaymsg output '*' bg "$img" fill >/dev/null
     fi
     sleep "$INTERVAL" &
