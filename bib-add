@@ -1,32 +1,64 @@
 #!/bin/bash
-# bib-add [--yes] [--dry-run] ISBN [keywords...]: look a book up on Open Library and add it to `references`.
+# bib-add [--yes] [--dry-run] ISBN [keywords...]
+# bib-add [--yes] [--dry-run] [--first] -s "title author" [keywords...]
+# Look a book up on Open Library and add it to `references`: by ISBN, or by searching (-s) and picking a result.
 # Works from anywhere; the bibliography project is ~/Projects/bibliography (override with $BIBLIOGRAPHY).
 # Shows the entry first and asks before appending (--yes skips the question, --dry-run only shows it).
+# A search result is added in its cover edition, which may not be the edition you own: use the ISBN for that.
 # %K is the keywords you give, or the title in lower case. Then refer2bib regenerates references.bib.
 here=${BIBLIOGRAPHY:-$HOME/Projects/bibliography}   # the project with `references` and refer2bib
 refs="$here/references"
+usage="usage: bib-add [--yes] [--dry-run] ISBN [keywords...]
+       bib-add [--yes] [--dry-run] [--first] -s \"title author\" [keywords...]"
 
-yes=0; dry=0
-while [[ ${1:-} == --* ]]; do
+yes=0; dry=0; first=0; query=""
+while [[ ${1:-} == -* ]]; do
     case $1 in
         --yes) yes=1 ;;
         --dry-run) dry=1 ;;
+        --first) first=1 ;;   # take the top search result without asking
+        -s) shift; query=${1:-}; [ -n "$query" ] || { echo "$usage" >&2; exit 2; } ;;
         *) echo "bib-add: unknown option $1" >&2; exit 2 ;;
     esac
     shift
 done
-[ $# -ge 1 ] || { echo "usage: bib-add [--yes] [--dry-run] ISBN [keywords...]" >&2; exit 2; }
 
-isbn=${1//[- ]/}; shift
-[[ $isbn =~ ^([0-9]{9}[0-9Xx]|[0-9]{13})$ ]] || { echo "bib-add: '$isbn' is not an ISBN-10 or ISBN-13" >&2; exit 2; }
-keywords="$*"
+if [ -n "$query" ]; then
+    keywords="$*"
+    result=$(curl -fsS -m 15 -G "https://openlibrary.org/search.json" \
+        --data-urlencode "q=$query" --data-urlencode "limit=15" \
+        --data-urlencode "fields=title,author_name,first_publish_year,edition_count,cover_edition_key") \
+        || { echo "bib-add: could not reach Open Library" >&2; exit 1; }
+    # one line per result: edition id <tab> label
+    list=$(jq -r '.docs[] | select(.cover_edition_key)
+        | "\(.cover_edition_key)\t\(.title) — \((.author_name // ["?"])[:2] | join(", ")) (\(.first_publish_year // "?"), \(.edition_count) editions)"' <<< "$result")
+    [ -n "$list" ] || { echo "bib-add: nothing found for '$query'" >&2; exit 1; }
 
-json=$(curl -fsS -m 15 "https://openlibrary.org/api/books?bibkeys=ISBN:$isbn&format=json&jscmd=data") \
+    if [ "$first" = 1 ] || [ "$(wc -l <<< "$list")" -eq 1 ]; then
+        pick=$(head -1 <<< "$list")
+    elif command -v fzf >/dev/null && [ -t 0 ]; then
+        pick=$(fzf --delimiter '\t' --with-nth 2 --prompt 'book> ' <<< "$list") || exit 0
+    else
+        cut -f2 <<< "$list" | nl -w2 -s'. ' >&2
+        read -r -p "Number: " n
+        pick=$(sed -n "${n}p" <<< "$list")
+        [ -n "$pick" ] || { echo "not added"; exit 0; }
+    fi
+    bibkey="OLID:${pick%%$'\t'*}"
+else
+    [ $# -ge 1 ] || { echo "$usage" >&2; exit 2; }
+    isbn=${1//[- ]/}; shift
+    [[ $isbn =~ ^([0-9]{9}[0-9Xx]|[0-9]{13})$ ]] || { echo "bib-add: '$isbn' is not an ISBN-10 or ISBN-13 (use -s to search)" >&2; exit 2; }
+    keywords="$*"
+    bibkey="ISBN:$isbn"
+fi
+
+json=$(curl -fsS -m 15 "https://openlibrary.org/api/books?bibkeys=$bibkey&format=json&jscmd=data") \
     || { echo "bib-add: could not reach Open Library" >&2; exit 1; }
-[ "$(jq -r --arg k "ISBN:$isbn" 'has($k)' <<< "$json")" = true ] \
-    || { echo "bib-add: Open Library does not know ISBN $isbn" >&2; exit 1; }
+[ "$(jq -r --arg k "$bibkey" 'has($k)' <<< "$json")" = true ] \
+    || { echo "bib-add: Open Library does not know $bibkey" >&2; exit 1; }
 
-entry=$(jq -r --arg k "ISBN:$isbn" --arg kw "$keywords" '
+entry=$(jq -r --arg k "$bibkey" --arg kw "$keywords" '
     .[$k] as $b
     | ($b.title + (if $b.subtitle then ": " + $b.subtitle else "" end)) as $title
     | [ "%K " + (if $kw != "" then $kw else ($title | ascii_downcase) end) ]
