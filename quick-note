@@ -1,27 +1,45 @@
 #!/bin/bash
-# Capture a line into today's note (~/Notes/YYYY-MM-DD.md, the daily note telekasten opens) without leaving what you're doing.
-# Added as a todo ("- [ ] text"); start the text with "n:" for a plain bullet instead ("- text").
+# quick-note: capture a line into today's note (~/Notes/YYYY-MM-DD.md, the daily note telekasten opens)
+# without leaving what you are doing. It is added as a todo ("- [ ] text"); start the text with "n:"
+# for a plain bullet instead ("- text").
 # NOTES_DIR overrides the folder; `quick-note --add TEXT` skips the prompt.
 dir=${NOTES_DIR:-$HOME/Notes}
 file="$dir/$(date +%F).md"
 
+trim() {
+    local text=$1
+    text=${text#"${text%%[![:space:]]*}"}     # leading whitespace
+    text=${text%"${text##*[![:space:]]}"}     # trailing whitespace
+    echo "$text"
+}
+
+# add TEXT: append it to today's note and print the line that was written
 add() {
-    local text=$1 line
-    text=${text#"${text%%[![:space:]]*}"}; text=${text%"${text##*[![:space:]]}"}   # trim
+    local text line
+    text=$(trim "$1")
     [ -n "$text" ] || return 1
+
     if [[ $text == n:* ]]; then
-        text=${text#n:}; text=${text#"${text%%[![:space:]]*}"}; line="- $text"
+        text=${text#n:}
+        text=${text#"${text%%[![:space:]]*}"}
+        line="- $text"
     else
         line="- [ ] $text"
     fi
+
     mkdir -p "$dir"
-    # don't glue the new line onto a last line that has no trailing newline
-    [ -s "$file" ] && [ -n "$(tail -c1 "$file")" ] && echo >> "$file"
+    # do not glue the new line onto a last line that has no trailing newline
+    if [ -s "$file" ] && [ -n "$(tail -c1 "$file")" ]; then
+        echo >> "$file"
+    fi
     echo "$line" >> "$file"
     echo "$line"
 }
 
-if [ "$1" = --add ]; then add "$2"; exit; fi
+if [ "$1" = --add ]; then
+    add "$2"
+    exit
+fi
 
 input=$(fuzzel --dmenu --prompt-only '󰎞 ' --width 60) || exit 0
 line=$(add "$input") || exit 0

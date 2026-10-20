@@ -1,11 +1,23 @@
 #!/bin/bash
-# scale-step ±DELTA | reset: change the scale of the focused output (until the next sway reload)
-# reset goes back to what the sway config sets: 1.5 on eDP-1, 1 elsewhere
-out=$(swaymsg -t get_outputs -r | jq -r '.[] | select(.focused).name')
+# scale-step ±DELTA | reset: change the scale of the focused output (until the next sway reload).
+# reset goes back to what the sway config sets: 1.5 on eDP-1, 1 elsewhere.
+output=$(swaymsg -t get_outputs -r | jq -r '.[] | select(.focused).name')
+
 if [ "$1" = reset ]; then
-    [ "$out" = eDP-1 ] && swaymsg output "$out" scale 1.5 || swaymsg output "$out" scale 1
+    if [ "$output" = eDP-1 ]; then
+        swaymsg output "$output" scale 1.5
+    else
+        swaymsg output "$output" scale 1
+    fi
     exit
 fi
-cur=$(swaymsg -t get_outputs -r | jq -r '.[] | select(.focused).scale')
-new=$(awk -v c="$cur" -v d="$1" 'BEGIN { s = c + d; if (s < 0.5) s = 0.5; if (s > 3) s = 3; print s }')
-swaymsg output "$out" scale "$new"
+
+# the new scale is the current one plus DELTA, kept between 0.5 and 3
+current=$(swaymsg -t get_outputs -r | jq -r '.[] | select(.focused).scale')
+new=$(awk -v current="$current" -v delta="$1" 'BEGIN {
+    scale = current + delta
+    if (scale < 0.5) scale = 0.5
+    if (scale > 3) scale = 3
+    print scale
+}')
+swaymsg output "$output" scale "$new"

@@ -1,21 +1,31 @@
 #!/bin/bash
-# Calculator in fuzzel using qalc (units, functions and currencies work: "5 km in miles", "sqrt(2)*3").
-# Type an expression, then pick the result to copy it. `calculator --eval EXPR` just prints the result.
+# calculator: calculator in fuzzel using qalc (units, functions and currencies work: "5 km in miles",
+# "sqrt(2)*3"). Type an expression, then pick the result to copy it.
+# `calculator --eval EXPR` just prints the result.
+
+# calc EXPRESSION: the result, as qalc prints it on its last line
 calc() {
-    local e=$1
-    e=${e// in / to }        # qalc reads "in" as inches; people mean "convert to"
-    e=${e//% of /% * }       # "20% of 85"
-    timeout 5 qalc -t "$e" 2>/dev/null | tail -n 1
+    local expression=$1
+    expression=${expression// in / to }       # qalc reads "in" as inches; people mean "convert to"
+    expression=${expression//% of /% * }      # "20% of 85"
+    timeout 5 qalc -t "$expression" 2>/dev/null | tail -n 1
 }
 
-if [ "$1" = --eval ]; then calc "$2"; exit 0; fi
+if [ "$1" = --eval ]; then
+    calc "$2"
+    exit 0
+fi
 
 while :; do
-    expr=$(fuzzel --dmenu --prompt-only '󰃬 ' --width 50) || exit 0
-    [ -n "$expr" ] || exit 0
-    result=$(calc "$expr")
+    expression=$(fuzzel --dmenu --prompt-only '󰃬 ' --width 50) || exit 0
+    [ -n "$expression" ] || exit 0
+
+    result=$(calc "$expression")
     [ -n "$result" ] || result="(could not calculate)"
-    pick=$(printf '= %s\n󰃬 New calculation\n' "$result" | fuzzel --dmenu --index --prompt "$expr " --width 50 --lines 2) || exit 0
+
+    # picking the result copies it, picking the other line starts over
+    pick=$(printf '= %s\n󰃬 New calculation\n' "$result" |
+        fuzzel --dmenu --index --prompt "$expression " --width 50 --lines 2) || exit 0
     if [ "$pick" = 0 ]; then
         printf '%s' "$result" | wl-copy
         notify-send -a calculator -t 1500 "Copied $result"
