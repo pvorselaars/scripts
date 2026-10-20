@@ -1,22 +1,24 @@
 #!/bin/sh
+# formatter FILE [indent options]: format FILE in place, depending on its extension.
+# Only C is configured: the kernel style from `indent`, with a 120 column limit.
 
 if [ -z "$1" ]; then
-	echo "usage: $(basename $0) FILE"
-	exit 1
+    echo "usage: $(basename "$0") FILE"
+    exit 1
 fi
 
-file=$(readlink -f $1)
-
-if [ -z "$file" ]; then
-	echo "$1: No such file" >&2
-	exit 1
+file=$(readlink -f "$1")
+if [ ! -e "$file" ]; then
+    echo "$1: No such file" >&2
+    exit 1
 fi
 
-dir=$(dirname $file)
-base=${file%.*}
-cd $dir || exit 1
+cd "$(dirname "$file")" || exit 1
 
-case $file in 
-	*\.c) VERSION_CONTROL=none indent -linux -sob -l120 -lc120 $@ ;;
-	*) echo "No formatter configured for $1" && exit 1 ;;
+case $file in
+    *.c) VERSION_CONTROL=none indent -linux -sob -l120 -lc120 "$@" ;;
+    *)
+        echo "No formatter configured for $1"
+        exit 1
+        ;;
 esac

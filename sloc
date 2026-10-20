@@ -1,2 +1,3 @@
 #!/bin/sh
-awk NF $1 | wc -l
+# sloc FILE: count the lines of FILE that are not blank.
+awk NF "$1" | wc -l

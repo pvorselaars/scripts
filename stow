@@ -1,9 +1,19 @@
 #!/bin/sh
+# stow PACKAGE_DIR: link every item of PACKAGE_DIR into the current directory.
+# Run it in the target, e.g. `cd ~/.config && stow ~/Projects/dotfiles/config`. Safe to run again.
+# The * glob skips hidden files, so those have to be linked by hand.
 
 pkg="$1"
-[ -z "$pkg" ] && echo "usage: $0 package_dir" && exit 1
-[ ! -d "$pkg" ] && echo "$pkg: Not a directory" && exit 1
 
-for f in "$pkg"/*; do
-    ln -sfn "$f" .
+if [ -z "$pkg" ]; then
+    echo "usage: $0 package_dir"
+    exit 1
+fi
+if [ ! -d "$pkg" ]; then
+    echo "$pkg: Not a directory"
+    exit 1
+fi
+
+for item in "$pkg"/*; do
+    ln -sfn "$item" .
 done

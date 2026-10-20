@@ -1,49 +1,56 @@
 #!/bin/sh
+# compiler FILE [ARGS...]: build and/or run FILE, depending on its extension.
+# Output files go next to FILE and are named after it (hello.c -> hello).
+#
+#   .c .cpp .rs .asm .s      compile, then run (ARGS are passed to .c programs)
+#   .cs .py .m .R .ps1       run with the matching interpreter
+#   .tex .me .mom .ms        build a PDF
+#   .dot .pic .sql .tf       graphviz images, pic, mysql, terraform plan
+#   anything else            run it if it starts with a #! line, otherwise show it with sent
 
 if [ -z "$1" ]; then
-	echo "usage: $(basename $0) FILE"
-	exit 1
+    echo "usage: $(basename "$0") FILE [ARGS...]"
+    exit 1
 fi
 
-file=$(readlink -f $1)
-
-if [ -z "$file" ]; then
-	echo "$1: No such file" >&2
-	exit 1
+file=$(readlink -f "$1")
+if [ ! -e "$file" ]; then
+    echo "$1: No such file" >&2
+    exit 1
 fi
 
-dir=$(dirname $file)
-base=${file%.*}
-cd $dir || exit 1
+dir=$(dirname "$file")
+base=${file%.*}          # the file name without its extension
+cd "$dir" || exit 1
+shift
 
-shebang=$(head -n 1 $file)
-shebang() {
-	case $shebang in
-		\#\!*) $file ;;
-		*) sent $file 2>/dev/null & ;;
-	esac	
+# a script with a #! line is run as it is; any other file is shown as a slide
+run_or_show() {
+    first_line=$(head -n 1 "$file")
+    case $first_line in
+        '#!'*) "$file" ;;
+        *) sent "$file" 2>/dev/null & ;;
+    esac
 }
 
-shift 1
-
-case $file in 
-	*\.asm) nasm -f elf32 -o $base.o $file && ld -m elf_i386 -o $base $base.o && $base ;;
-	*\.c) cc -Wall -g -O0 -pedantic -std=c2x $file -o $base && $base $@ ;;
-	*\.cpp) g++ -Wall $file -o $base && $base ;;
-	*\.cs) dotnet run $file ;;
-	*\.dot) dot -Tpng -O $file && dot -Tsvg -O $file ;;
-	*\.m) octave -q --persist $file ;;
-	*\.me) groff $file -pejR -me -Tpdf > $base.pdf ;;
-	*\.mom) groff $file -pejR -mom -Tpdf > $base.pdf ;;
-	*\.ms) groff $file -pejR -ms -Tpdf > $base.pdf ;;
-	*\.pic) pic $file > $base.ps ;;
-	*\.ps1) pwsh -nologo -noexit -file $file ;;
-	*\.py) ipython3 --no-banner -i $file ;;
-	*\.R) R --vanilla < $file ;;
-	*\.rs) rustc $file -o $base && $base ;;
-	*\.sql) mysql < $file > $base.tab ;;
-	*\.s) as $file -o $base.o && ld $base.o -o $base && $base ;;
-	*\.tf) terraform validate -no-color && terraform plan -no-color -out=$base.tfplan ;;
-	*\.tex) pdflatex $file ;;
-	*) shebang ;;
+case $file in
+    *.asm)  nasm -f elf32 -o "$base.o" "$file" && ld -m elf_i386 -o "$base" "$base.o" && "$base" ;;
+    *.c)    cc -Wall -g -O0 -pedantic -std=c2x "$file" -o "$base" && "$base" "$@" ;;
+    *.cpp)  g++ -Wall "$file" -o "$base" && "$base" ;;
+    *.cs)   dotnet run "$file" ;;
+    *.dot)  dot -Tpng -O "$file" && dot -Tsvg -O "$file" ;;
+    *.m)    octave -q --persist "$file" ;;
+    *.me)   groff "$file" -pejR -me -Tpdf > "$base.pdf" ;;
+    *.mom)  groff "$file" -pejR -mom -Tpdf > "$base.pdf" ;;
+    *.ms)   groff "$file" -pejR -ms -Tpdf > "$base.pdf" ;;
+    *.pic)  pic "$file" > "$base.ps" ;;
+    *.ps1)  pwsh -nologo -noexit -file "$file" ;;
+    *.py)   ipython3 --no-banner -i "$file" ;;
+    *.R)    R --vanilla < "$file" ;;
+    *.rs)   rustc "$file" -o "$base" && "$base" ;;
+    *.sql)  mysql < "$file" > "$base.tab" ;;
+    *.s)    as "$file" -o "$base.o" && ld "$base.o" -o "$base" && "$base" ;;
+    *.tf)   terraform validate -no-color && terraform plan -no-color -out="$base.tfplan" ;;
+    *.tex)  pdflatex "$file" ;;
+    *)      run_or_show ;;
 esac

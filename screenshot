@@ -1,2 +1,3 @@
 #!/bin/sh
+# screenshot: save the whole screen to ~/pictures/screenshots/MM-DD-YYYY-HHMMSS.png
 grim "$HOME/pictures/screenshots/$(date +'%m-%d-%Y-%H%M%S').png"

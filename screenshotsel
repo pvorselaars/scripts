@@ -1,2 +1,3 @@
 #!/bin/sh
+# screenshotsel: save a selected area to ~/pictures/screenshots/MM-DD-YYYY-HHMMSS.png
 grim -g "$(slurp)" "$HOME/pictures/screenshots/$(date +'%m-%d-%Y-%H%M%S').png"
