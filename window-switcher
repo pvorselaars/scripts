@@ -1,5 +1,7 @@
 #!/bin/bash
-# Pick an open window in fuzzel and focus it. `window-switcher --print` lists them instead.
+# window-switcher: pick an open window in fuzzel and focus it. `window-switcher --print` lists them instead.
+
+# one tab-separated line per window: id, workspace, app, title (the scratchpad is named "scratch")
 windows=$(swaymsg -t get_tree | jq -r '
     .. | select(.type? == "workspace") as $ws | $ws
     | .. | objects
@@ -8,12 +10,17 @@ windows=$(swaymsg -t get_tree | jq -r '
        (.app_id // .window_properties.class // "?"), (.name // "")] | @tsv')
 [ -n "$windows" ] || exit 0
 
-ids=(); labels=()
-while IFS=$'\t' read -r id ws app title; do
-    ids+=("$id"); labels+=("$(printf '%-8s %-16s %s' "[$ws]" "$app" "${title:0:70}")")
+ids=()      # what focusing a window needs
+labels=()   # what the menu shows, at the same index
+while IFS=$'\t' read -r id workspace app title; do
+    ids+=("$id")
+    labels+=("$(printf '%-8s %-16s %s' "[$workspace]" "$app" "${title:0:70}")")
 done <<< "$windows"
 
-if [ "$1" = --print ]; then printf '%s\n' "${labels[@]}"; exit 0; fi
+if [ "$1" = --print ]; then
+    printf '%s\n' "${labels[@]}"
+    exit 0
+fi
 
 choice=$(printf '%s\n' "${labels[@]}" | fuzzel --dmenu --index --prompt 'window> ' --width 80 --lines 12) || exit 0
 swaymsg "[con_id=${ids[$choice]}] focus" >/dev/null

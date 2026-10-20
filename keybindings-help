@@ -1,33 +1,63 @@
 #!/bin/bash
-# Searchable list of the sway keybindings, read from the config so it never goes stale.
+# keybindings-help: searchable list of the sway keybindings, read from the config so it never goes stale.
 # Shown in fuzzel; `keybindings-help --print` prints the list instead.
 conf="$HOME/.config/sway/config"
 
+# the `set $name value` lines of the config: var[name]=value
 declare -A var
-while read -r _ name value; do var[${name#\$}]=$value; done < <(grep -E '^set \$[A-Za-z]+ ' "$conf")
+while read -r _ name value; do
+    var[${name#\$}]=$value
+done < <(grep -E '^set \$[A-Za-z]+ ' "$conf")
 
-expand() {   # replace $variables; multi-word ones (like $lock) are left alone
-    local s=$1 k
-    for k in "${!var[@]}"; do
-        [[ ${var[$k]} == *" "* ]] || s=${s//\$$k/${var[$k]}}
+# replace $variables; multi-word ones (like $lock) are left alone
+expand() {
+    local text=$1 name
+    for name in "${!var[@]}"; do
+        [[ ${var[$name]} == *" "* ]] || text=${text//\$$name/${var[$name]}}
     done
-    echo "$s"
+    echo "$text"
 }
 
+# sway key names -> what is printed on the keys: "Mod4+question" -> "Super+?"
+pretty_key() {
+    local key=$1 kind=$2
+    key=$(expand "$key")
+    key=${key//Mod4/Super}
+    key=${key//Mod1/Alt}
+    key=${key//question/?}
+    key=${key//grave/\`}
+    key=${key//minus/-}
+    key=${key//backslash/\\}
+    key=${key//bracketleft/[}
+    key=${key//bracketright/]}
+    [ "$kind" = bindgesture ] && key=${key//:/ }      # swipe:3:left -> swipe 3 left
+    echo "$key"
+}
+
+# the command without its variables, the script folder and the leading "exec"
+pretty_command() {
+    local cmd
+    cmd=$(expand "$1")
+    cmd=${cmd//\~\/.local\/bin\//}
+    echo "${cmd#exec }"
+}
+
+# one line per binding: key, command, and the "### section" of the config it is in
 list() {
-    local section="" line key cmd
+    local section="" line kind key cmd
     while IFS= read -r line; do
         case $line in
-            '### '*) section=${line#\#\#\# }; section=${section%% (*}; section=${section%%:*} ;;
+            '### '*)
+                section=${line#\#\#\# }
+                section=${section%% (*}       # "Scratchpad (..)" -> "Scratchpad"
+                section=${section%%:*}        # "Theme: ..." -> "Theme"
+                ;;
             bindsym\ *|bindgesture\ *)
-                kind=${line%% *}; line=${line#* }
-                while [[ $line == --* ]]; do line=${line#* }; done   # --locked, --release, ...
-                key=${line%% *}; cmd=${line#* }
-                key=$(expand "$key"); key=${key//Mod4/Super}; key=${key//Mod1/Alt}
-                key=${key//question/?}; key=${key//grave/\`}; key=${key//minus/-}; key=${key//backslash/\\}
-                key=${key//bracketleft/[}; key=${key//bracketright/]}
-                [ "$kind" = bindgesture ] && key=${key//:/ }
-                cmd=$(expand "$cmd"); cmd=${cmd//\~\/.local\/bin\//}; cmd=${cmd#exec }
+                kind=${line%% *}
+                line=${line#* }
+                while [[ $line == --* ]]; do line=${line#* }; done    # skip --locked, --release, ...
+                key=$(pretty_key "${line%% *}" "$kind")
+                cmd=$(pretty_command "${line#* }")
                 printf '%-26s %-48s %s\n' "$key" "${cmd:0:46}" "· $section"
                 ;;
         esac

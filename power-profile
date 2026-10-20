@@ -1,21 +1,43 @@
 #!/bin/sh
-# Pick a power profile in fuzzel (power-saver, balanced, performance).
+# power-profile: pick a power profile in fuzzel (power-saver, balanced, performance).
 # Talks to the power-profiles D-Bus API that tuned-ppd provides, so no extra package is needed.
 # `power-profile set <name>` switches without the menu, `power-profile get` prints the current one.
-dest=net.hadess.PowerProfiles path=/net/hadess/PowerProfiles iface=net.hadess.PowerProfiles
+dest=net.hadess.PowerProfiles
+path=/net/hadess/PowerProfiles
+iface=net.hadess.PowerProfiles
 
-get() { busctl --system get-property $dest $path $iface ActiveProfile | cut -d'"' -f2; }
-set_profile() { busctl --system set-property $dest $path $iface ActiveProfile s "$1"; }
+get_profile() {
+    busctl --system get-property $dest $path $iface ActiveProfile | cut -d'"' -f2
+}
+
+set_profile() {
+    busctl --system set-property $dest $path $iface ActiveProfile s "$1"
+}
 
 case ${1:-} in
-    get) get; exit ;;
+    get) get_profile; exit ;;
     set) set_profile "$2"; exit ;;
 esac
 
-current=$(get)
-mark() { [ "$1" = "$current" ] && printf '%s  ●\n' "$2" || printf '%s\n' "$2"; }
-choice=$({ mark power-saver '󰌪 power-saver'; mark balanced '󰾅 balanced'; mark performance '󰓅 performance'; } |
-    fuzzel --dmenu --prompt 'profile> ' --lines 3 --width 24) || exit 0
+current=$(get_profile)
 
-name=$(printf '%s' "$choice" | sed 's/^[^ ]* //; s/ .*//')
-[ -n "$name" ] && set_profile "$name" && { notify-send -t 2000 "Power profile" "$name"; ~/.local/bin/statusbar-refresh; }
+# mark NAME LABEL: print the menu line for a profile, with a dot after the active one
+mark() {
+    if [ "$1" = "$current" ]; then
+        printf '%s  ●\n' "$2"
+    else
+        printf '%s\n' "$2"
+    fi
+}
+
+choice=$({
+    mark power-saver '󰌪 power-saver'
+    mark balanced '󰾅 balanced'
+    mark performance '󰓅 performance'
+} | fuzzel --dmenu --prompt 'profile> ' --lines 3 --width 24) || exit 0
+
+name=$(printf '%s' "$choice" | sed 's/^[^ ]* //; s/ .*//')    # drop the icon and the dot
+if [ -n "$name" ] && set_profile "$name"; then
+    notify-send -t 2000 "Power profile" "$name"
+    ~/.local/bin/statusbar-refresh
+fi
