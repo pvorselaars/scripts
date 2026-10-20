@@ -1,71 +1,138 @@
 #!/bin/bash
-# Wi-Fi menu in fuzzel (nmcli): pick a network to connect, or toggle/rescan/disconnect.
-# `wifi-menu --print` lists the entries without showing the menu.
+# wifi-menu: Wi-Fi menu in fuzzel (nmcli). Pick a network to connect to it, or turn Wi-Fi off,
+# rescan, or disconnect. `wifi-menu --print` lists the entries without showing the menu.
+
+SEP=$'\x1f'   # unit separator: unlike a tab it survives `read` when a field is empty
+TURN_ON="󰖩 Turn Wi-Fi on"
+
 menu() { fuzzel --dmenu --index --prompt "$1" --width 48 --lines 12; }
 say() { notify-send -a wifi "$@"; }
 
-signal_icon() { if [ "$1" -ge 75 ]; then echo 󰤨; elif [ "$1" -ge 50 ]; then echo 󰤥; elif [ "$1" -ge 25 ]; then echo 󰤢; else echo 󰤟; fi; }
+# signal strength in percent -> icon
+signal_icon() {
+    local percent=$1
+    if   [ "$percent" -ge 75 ]; then echo 󰤨
+    elif [ "$percent" -ge 50 ]; then echo 󰤥
+    elif [ "$percent" -ge 25 ]; then echo 󰤢
+    else echo 󰤟
+    fi
+}
 
+# --- Wi-Fi is off: the only thing to offer is turning it on
 if [ "$(nmcli radio wifi)" = disabled ]; then
-    [ "$1" = --print ] && { echo "󰖩 Turn Wi-Fi on"; exit 0; }
-    [ "$(printf '󰖩 Turn Wi-Fi on\n' | menu 'wifi> ')" = 0 ] && nmcli radio wifi on && say "Wi-Fi on"
+    if [ "$1" = --print ]; then
+        echo "$TURN_ON"
+    elif [ "$(printf '%s\n' "$TURN_ON" | menu 'wifi> ')" = 0 ]; then
+        nmcli radio wifi on && say "Wi-Fi on"
+    fi
     exit 0
 fi
 
-# no rescan here: the list is empty while a scan is running, so show the cached one (pick Rescan to refresh)
-
-# signal US in-use US security US ssid (US = 0x1f: unlike tabs, empty fields survive `read`),
-# strongest first, one line per SSID; hidden networks (shown as "--") are skipped
-networks=$(
+# One line per visible network, strongest first: signal SEP in-use SEP security SEP ssid.
+# Hidden networks (SSID "--") and repeated SSIDs are left out.
+# There is no rescan here, because the list is empty while a scan runs: it shows the cached
+# list, and the Rescan entry refreshes it.
+list_networks() {
+    local line key value in_use signal security
     while IFS= read -r line; do
-        key=${line%%:*}; val=${line#*:}; val=${val#"${val%%[![:space:]]*}"}
+        key=${line%%:*}
+        value=${line#*:}
+        value=${value#"${value%%[![:space:]]*}"}   # drop the leading spaces
         case $key in
-            IN-USE) inuse=$val ;;
-            SIGNAL) sig=$val ;;
-            SECURITY) sec=$val ;;
-            SSID) [ -n "$val" ] && [ "$val" != -- ] && printf '%s\x1f%s\x1f%s\x1f%s\n' "$sig" "$inuse" "$sec" "$val" ;;
+            IN-USE)   in_use=$value ;;
+            SIGNAL)   signal=$value ;;
+            SECURITY) security=$value ;;
+            SSID)
+                if [ -n "$value" ] && [ "$value" != -- ]; then
+                    printf '%s\x1f%s\x1f%s\x1f%s\n' "$signal" "$in_use" "$security" "$value"
+                fi
+                ;;
         esac
     done < <(nmcli -m multiline -f IN-USE,SIGNAL,SECURITY,SSID device wifi list --rescan no) |
-        sort -t$'\x1f' -k1,1nr | awk -F'\x1f' '!seen[$4]++'
-)
+        sort -t"$SEP" -k1,1nr |
+        awk -F"$SEP" '!seen[$4]++'
+}
 
-# the SSID we are connected to (an SSID can be several access points; the one in use isn't always the strongest)
-active_conn=$(nmcli -t -f NAME,TYPE connection show --active | sed -n 's/:802-11-wireless$//p' | head -1)
-active_ssid=""
-[ -n "$active_conn" ] && active_ssid=$(nmcli -g 802-11-wireless.ssid connection show "$active_conn" 2>/dev/null)
+# The SSID we are connected to. It comes from the active connection: an SSID can be several
+# access points, and the one in use is not always the strongest.
+active_ssid() {
+    local connection
+    connection=$(nmcli -t -f NAME,TYPE connection show --active | sed -n 's/:802-11-wireless$//p' | head -1)
+    [ -n "$connection" ] && nmcli -g 802-11-wireless.ssid connection show "$connection" 2>/dev/null
+}
 
-entries=()    # parallel arrays: label and action
-actions=()
+wifi_device() {
+    nmcli -t -f DEVICE,TYPE device | sed -n 's/:wifi$//p' | head -1
+}
+
+entries=()   # what the menu shows
+actions=()   # what picking an entry does, at the same index
 add() { entries+=("$1"); actions+=("$2"); }
-if nmcli -t -f TYPE,STATE device | grep -q '^wifi:connected$'; then add "󰖪 Disconnect" disconnect; fi
-add "󰑓 Rescan" rescan
-add "󰖪 Turn Wi-Fi off" off
-while IFS=$'\x1f' read -r sig inuse sec ssid; do
-    [ -z "$ssid" ] && continue
-    label="$(signal_icon "$sig") $ssid"
-    [ "$sec" != "--" ] && label+="  [$sec]"
-    [ "$ssid" = "$active_ssid" ] && label+="  (connected)"
-    add "$label" "net:$ssid:$sec"
-done <<< "$networks"
 
-if [ "$1" = --print ]; then printf '%s\n' "${entries[@]}"; exit 0; fi
+build_entries() {
+    local signal in_use security ssid label active
+    active=$(active_ssid)
+
+    if nmcli -t -f TYPE,STATE device | grep -q '^wifi:connected$'; then
+        add "󰖪 Disconnect" disconnect
+    fi
+    add "󰑓 Rescan" rescan
+    add "󰖪 Turn Wi-Fi off" off
+
+    while IFS=$SEP read -r signal in_use security ssid; do
+        [ -z "$ssid" ] && continue
+        label="$(signal_icon "$signal") $ssid"
+        [ "$security" != "--" ] && label+="  [$security]"
+        [ "$ssid" = "$active" ] && label+="  (connected)"
+        add "$label" "net:$ssid:$security"
+    done <<< "$(list_networks)"
+}
+
+# connect_to SSID SECURITY: a saved connection is brought up, an open network is joined,
+# and for a secured new one the password is asked first.
+connect_to() {
+    local ssid=$1 security=$2 output password status
+
+    if nmcli -g NAME connection show | grep -Fxq -- "$ssid"; then
+        output=$(nmcli connection up id "$ssid" 2>&1)
+    elif [ "$security" = -- ]; then
+        output=$(nmcli device wifi connect "$ssid" 2>&1)
+    else
+        password=$(fuzzel --dmenu --password --lines 0 --prompt "$ssid password: ") || exit 0
+        output=$(nmcli device wifi connect "$ssid" password "$password" 2>&1)
+    fi
+    status=$?
+
+    if [ "$status" -eq 0 ]; then
+        say "Connected to $ssid"
+    else
+        say -u critical "Could not connect to $ssid" "$output"
+    fi
+}
+
+build_entries
+if [ "$1" = --print ]; then
+    printf '%s\n' "${entries[@]}"
+    exit 0
+fi
 
 choice=$(printf '%s\n' "${entries[@]}" | menu 'wifi> ') || exit 0
 action=${actions[$choice]}
+
 case $action in
-    disconnect) nmcli device disconnect "$(nmcli -t -f DEVICE,TYPE device | sed -n 's/:wifi$//p' | head -1)" >/dev/null && say "Disconnected" ;;
-    rescan) timeout 5 nmcli device wifi rescan >/dev/null 2>&1; sleep 3; exec "$0" ;;
-    off) nmcli radio wifi off && say "Wi-Fi off" ;;
+    disconnect)
+        nmcli device disconnect "$(wifi_device)" >/dev/null && say "Disconnected"
+        ;;
+    rescan)
+        timeout 5 nmcli device wifi rescan >/dev/null 2>&1
+        sleep 3
+        exec "$0"
+        ;;
+    off)
+        nmcli radio wifi off && say "Wi-Fi off"
+        ;;
     net:*)
-        rest=${action#net:}; sec=${rest##*:}; ssid=${rest%:*}
-        if nmcli -g NAME connection show | grep -Fxq -- "$ssid"; then
-            out=$(nmcli connection up id "$ssid" 2>&1)
-        elif [ "$sec" = -- ]; then
-            out=$(nmcli device wifi connect "$ssid" 2>&1)
-        else
-            pw=$(fuzzel --dmenu --password --lines 0 --prompt "$ssid password: ") || exit 0
-            out=$(nmcli device wifi connect "$ssid" password "$pw" 2>&1)
-        fi
-        if [ $? -eq 0 ]; then say "Connected to $ssid"; else say -u critical "Could not connect to $ssid" "$out"; fi
+        details=${action#net:}              # SSID:SECURITY, and the SSID may contain colons
+        connect_to "${details%:*}" "${details##*:}"
         ;;
 esac
