@@ -1,0 +1,39 @@
+#!/bin/bash
+# Pick an emoji or symbol in fuzzel and copy it to the clipboard.
+# Uses the full emoji list if the unicode-emoji package is installed, otherwise a built-in subset by Unicode name.
+# `emoji-picker --print` lists the entries instead.
+list() {
+python3 -I - <<'PY'
+import os, unicodedata
+seen = set()
+def add(ch, name):
+    if ch not in seen:
+        seen.add(ch); print(f"{ch}  {name}")
+
+test = "/usr/share/unicode/emoji/emoji-test.txt"
+if os.path.exists(test):
+    for line in open(test, encoding="utf-8"):
+        if line.startswith("#") or "; fully-qualified" not in line:
+            continue
+        rest = line.split("#", 1)[1].split(None, 2)      # char, Ex.y, name
+        if len(rest) == 3:
+            add(rest[0], rest[2].strip())
+
+ranges = [(0x1F300, 0x1FAFF), (0x2600, 0x27BF), (0x2190, 0x21FF), (0x2200, 0x22FF), (0x2300, 0x23FF),
+          (0x25A0, 0x25FF), (0x20A0, 0x20CF), (0x2100, 0x214F), (0x00A1, 0x00BF), (0x0391, 0x03C9), (0x2B00, 0x2BFF)]
+for lo, hi in ranges:
+    for cp in range(lo, hi + 1):
+        try:
+            add(chr(cp), unicodedata.name(chr(cp)).lower())
+        except ValueError:
+            pass
+for cp in (0xD7, 0xF7):
+    add(chr(cp), unicodedata.name(chr(cp)).lower())
+PY
+}
+
+if [ "$1" = --print ]; then list; exit 0; fi
+choice=$(list | fuzzel --dmenu --prompt 'emoji> ' --width 60 --lines 12) || exit 0
+char=${choice%%  *}
+printf '%s' "$char" | wl-copy
+notify-send -a emoji -t 1500 "Copied $char"

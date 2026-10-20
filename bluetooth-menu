@@ -1,0 +1,45 @@
+#!/bin/bash
+# Bluetooth menu in fuzzel (bluetoothctl): connect/disconnect known devices, pair new ones,
+# toggle power. `bluetooth-menu --print` lists the entries without showing the menu.
+menu() { fuzzel --dmenu --index --prompt "$1" --width 48 --lines 12; }
+say() { notify-send -a bluetooth "$@"; }
+
+powered=$(bluetoothctl show | awk '/Powered:/ {print $2}')
+if [ "$powered" != yes ]; then
+    [ "$1" = --print ] && { echo "󰂯 Power on"; exit 0; }
+    [ "$(printf '󰂯 Power on\n' | menu 'bluetooth> ')" = 0 ] && bluetoothctl power on >/dev/null && say "Bluetooth on"
+    exit 0
+fi
+
+entries=(); actions=()
+add() { entries+=("$1"); actions+=("$2"); }
+add "󰂲 Power off" off
+add "󰑓 Scan for new devices (8s)" scan
+
+# connected first, then paired, then newly discovered
+connected=(); paired=(); new=()
+while read -r _ mac name; do
+    info=$(bluetoothctl info "$mac" 2>/dev/null)
+    if grep -q 'Connected: yes' <<< "$info"; then connected+=("$mac|$name")
+    elif grep -q 'Paired: yes' <<< "$info"; then paired+=("$mac|$name")
+    else new+=("$mac|$name"); fi
+done < <(bluetoothctl devices)
+for d in "${connected[@]}"; do add "󰂱 ${d#*|}  (connected)" "disconnect:${d%%|*}"; done
+for d in "${paired[@]}";    do add "󰂯 ${d#*|}" "connect:${d%%|*}"; done
+for d in "${new[@]}";       do add "󰂳 ${d#*|}  (new)" "pair:${d%%|*}"; done
+
+if [ "$1" = --print ]; then printf '%s\n' "${entries[@]}"; exit 0; fi
+
+choice=$(printf '%s\n' "${entries[@]}" | menu 'bluetooth> ') || exit 0
+action=${actions[$choice]}
+mac=${action#*:}
+case $action in
+    off) bluetoothctl power off >/dev/null && say "Bluetooth off" ;;
+    scan) say "Scanning for 8 seconds"; bluetoothctl --timeout 8 scan on >/dev/null 2>&1; exec "$0" ;;
+    disconnect:*) bluetoothctl disconnect "$mac" >/dev/null && say "Disconnected" ;;
+    connect:*)
+        if bluetoothctl connect "$mac" >/dev/null 2>&1; then say "Connected"; else say -u critical "Could not connect"; fi ;;
+    pair:*)
+        if bluetoothctl pair "$mac" >/dev/null 2>&1 && bluetoothctl trust "$mac" >/dev/null 2>&1 && bluetoothctl connect "$mac" >/dev/null 2>&1
+        then say "Paired and connected"; else say -u critical "Could not pair"; fi ;;
+esac

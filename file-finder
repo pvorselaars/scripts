@@ -1,0 +1,13 @@
+#!/bin/bash
+# Fuzzy-find files and folders under $HOME in fuzzel and open the pick with xdg-open.
+# `file-finder --print` lists the entries instead. Hidden and git-ignored paths are skipped (fd defaults).
+list() {
+    fd --type f --type d --max-depth 8 \
+        --exclude node_modules --exclude .git --exclude __pycache__ --exclude bin --exclude obj \
+        . "$HOME" 2>/dev/null | sed "s|^$HOME/|~/|"
+}
+
+if [ "$1" = --print ]; then list; exit 0; fi
+choice=$(list | fuzzel --dmenu --prompt 'file> ' --width 90 --lines 15) || exit 0
+path=${choice/#\~\//$HOME/}
+exec xdg-open "$path" >/dev/null 2>&1

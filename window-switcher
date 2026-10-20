@@ -1,0 +1,19 @@
+#!/bin/bash
+# Pick an open window in fuzzel and focus it. `window-switcher --print` lists them instead.
+windows=$(swaymsg -t get_tree | jq -r '
+    .. | select(.type? == "workspace") as $ws | $ws
+    | .. | objects
+    | select((.pid? // 0) > 0 and ((.nodes // []) | length) == 0)
+    | [.id, (if $ws.name == "__i3_scratch" then "scratch" else $ws.name end),
+       (.app_id // .window_properties.class // "?"), (.name // "")] | @tsv')
+[ -n "$windows" ] || exit 0
+
+ids=(); labels=()
+while IFS=$'\t' read -r id ws app title; do
+    ids+=("$id"); labels+=("$(printf '%-8s %-16s %s' "[$ws]" "$app" "${title:0:70}")")
+done <<< "$windows"
+
+if [ "$1" = --print ]; then printf '%s\n' "${labels[@]}"; exit 0; fi
+
+choice=$(printf '%s\n' "${labels[@]}" | fuzzel --dmenu --index --prompt 'window> ' --width 80 --lines 12) || exit 0
+swaymsg "[con_id=${ids[$choice]}] focus" >/dev/null
