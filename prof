@@ -16,106 +16,231 @@
 #   prof net-gc PID                heap dump of a running .NET process, top types by size
 #
 # PROF_DRY=1 prints the commands instead of running them; PROF_NOVIEW=1 skips opening the viewer.
+
 export PATH="$HOME/.local/bin:$HOME/.dotnet/tools:$PATH"
 dir=${PROF_DIR:-.bench}
 ts=$(date +%Y%m%d-%H%M%S)
 
-usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
-die() { echo "prof: $*" >&2; exit 1; }
-need() { [ -n "$PROF_DRY" ] || command -v "$1" >/dev/null || die "$1 not found${2:+ ($2)}"; }
-run() { if [ -n "$PROF_DRY" ]; then echo "+ $*"; else "$@"; fi; }
-view() { # open a profile in speedscope, detached
-    echo "profile: $1"
-    [ -n "$PROF_NOVIEW" ] || [ -n "$PROF_DRY" ] || { need speedscope "npm install -g --prefix ~/.local speedscope"; setsid -f speedscope "$1" >/dev/null 2>&1; }
-}
-cmdargs() { [ "$1" = -- ] && shift; [ $# -gt 0 ] || die "no command given (prof $sub -- CMD [ARGS])"; CMD=("$@"); }
+# --- helpers -----------------------------------------------------------------------------------
 
-sub=$1; shift
+# the comment block at the top of this file, without the "# "
+usage() { sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//'; }
+
+die() { echo "prof: $*" >&2; exit 1; }
+
+# need COMMAND [HINT]: stop with an install hint unless COMMAND exists (a dry run does not check)
+need() {
+    [ -n "$PROF_DRY" ] || command -v "$1" >/dev/null || die "$1 not found${2:+ ($2)}"
+}
+
+# run COMMAND...: run it, or only print it in a dry run
+run() {
+    if [ -n "$PROF_DRY" ]; then
+        echo "+ $*"
+    else
+        "$@"
+    fi
+}
+
+# view FILE: print the profile path and open it in speedscope, detached
+view() {
+    echo "profile: $1"
+    if [ -z "$PROF_NOVIEW" ] && [ -z "$PROF_DRY" ]; then
+        need speedscope "npm install -g --prefix ~/.local speedscope"
+        setsid -f speedscope "$1" >/dev/null 2>&1
+    fi
+}
+
+# cmdargs "$@": put the command to profile (after an optional --) in the array CMD
+cmdargs() {
+    [ "$1" = -- ] && shift
+    [ $# -gt 0 ] || die "no command given (prof $sub -- CMD [ARGS])"
+    CMD=("$@")
+}
+
+# the newest perf recording in $dir (empty when there is none)
+newest_recording() {
+    ls -1t "$dir"/perf-*.data 2>/dev/null | head -n 1
+}
+
+# --- C: perf, valgrind, heaptrack --------------------------------------------------------------
+
+cmd_build() {
+    local src=$1 out
+    [ -f "$src" ] || die "usage: prof build FILE.c [OUT]"
+    out=${2:-${src%.c}-prof}
+    # $CFLAGS and $LDLIBS are left unquoted on purpose: they hold several words
+    # shellcheck disable=SC2086
+    run cc -O2 -g -fno-omit-frame-pointer -std=c2x -Wall -pedantic $CFLAGS "$src" -o "$out" $LDLIBS || exit $?
+    echo "$out"
+}
+
+cmd_stat() {
+    cmdargs "$@"
+    need perf "sudo dnf install perf"
+    run perf stat -d -r "${PROF_RUNS:-5}" -- "${CMD[@]}"
+}
+
+cmd_flame() {
+    local data="$dir/perf-$ts.data" text="$dir/perf-$ts.perf.txt"
+    local freq=${PROF_FREQ:-4999} callgraph=${PROF_CALLGRAPH:-fp} event=${PROF_EVENT:-cycles:u}
+    cmdargs "$@"
+    need perf "sudo dnf install perf"
+    mkdir -p "$dir"
+
+    # --user-callchains: with kernel.perf_event_paranoid=2 (the Fedora default) kernel stacks are not allowed
+    record() {
+        perf record -F "$freq" -e "$1" --call-graph "$callgraph" --user-callchains -o "$data" -- "${CMD[@]}"
+    }
+
+    if [ -n "$PROF_DRY" ]; then
+        echo "+ perf record -F $freq -e $event --call-graph $callgraph --user-callchains -o $data -- ${CMD[*]}"
+    else
+        # cycles:u needs hardware counters; fall back to the software clock (e.g. in a VM)
+        record "$event" 2>/dev/null || {
+            echo "prof: cycles:u unavailable, using the software clock" >&2
+            record cpu-clock:u
+        } || exit $?
+    fi
+
+    if [ -n "$PROF_DRY" ]; then
+        echo "+ perf script -i $data -F +pid > $text"
+    else
+        perf script -i "$data" -F +pid > "$text" || exit $?
+    fi
+    view "$text"
+    echo "other views: prof report (terminal), prof hotspot (GUI)"
+}
+
+cmd_report() {
+    local data
+    need perf "sudo dnf install perf"
+    data=$(newest_recording)
+    [ -n "$data" ] || die "no recording in $dir (run prof flame first)"
+    run perf report -i "$data"
+}
+
+cmd_hotspot() {
+    local data=${1:-$(newest_recording)}
+    need hotspot "sudo dnf install hotspot"
+    [ -n "$data" ] || die "no recording in $dir (run prof flame first)"
+    if [ -n "$PROF_DRY" ]; then
+        echo "+ hotspot $data"
+    else
+        setsid -f hotspot "$data" >/dev/null 2>&1
+        echo "opened $data in hotspot"
+    fi
+}
+
+cmd_callgrind() {
+    local out="$dir/callgrind-$ts.out"
+    cmdargs "$@"
+    need valgrind "sudo dnf install valgrind"
+    mkdir -p "$dir"
+    run valgrind --tool=callgrind --callgrind-out-file="$out" "${CMD[@]}" || exit $?
+
+    if command -v kcachegrind >/dev/null && [ -z "$PROF_NOVIEW" ] && [ -z "$PROF_DRY" ]; then
+        setsid -f kcachegrind "$out" >/dev/null 2>&1
+    else
+        # no GUI: show the total and the costliest functions
+        run callgrind_annotate "$out" |
+            awk '/PROGRAM TOTALS/ {print} /file:function/ {f=1} f && NF {print} f && !NF {exit}' |
+            head -n 16
+    fi
+    echo "profile: $out"
+}
+
+cmd_heap() {
+    local out="$dir/heaptrack-$ts" file report
+    cmdargs "$@"
+    need heaptrack "sudo dnf install heaptrack"
+    mkdir -p "$dir"
+    # --record-only: the plain wrapper opens heaptrack_gui and waits for you to close it
+    run heaptrack --record-only -o "$out" "${CMD[@]}" || exit $?
+
+    file=$(ls -1 "$out".* 2>/dev/null | head -n 1)
+    [ -n "$PROF_DRY" ] && file="$out.zst"
+
+    if [ -z "$PROF_DRY" ]; then
+        report=$(heaptrack_print "$file")
+        echo
+        echo "$report" | tail -n 6
+        echo
+        echo "most allocations from:"
+        echo "$report" | sed -n '/MOST CALLS TO ALLOCATION FUNCTIONS/,+8p' | tail -n 8 | cut -c1-110
+    else
+        echo "+ heaptrack_print $file"
+    fi
+    echo "profile: $file   (GUI: heaptrack_gui $file)"
+}
+
+# --- .NET: dotnet-trace, dotnet-counters, dotnet-gcdump ----------------------------------------
+
+cmd_net_build() {
+    local project=${1:-.} csproj
+    if [ -d "$project" ]; then
+        csproj=$(ls "$project"/*.csproj 2>/dev/null | head -n 1)
+    else
+        csproj=$project
+    fi
+    [ -f "$csproj" ] || [ -n "$PROF_DRY" ] || die "no .csproj in $project"
+
+    run dotnet build -c Release --nologo -v q "$csproj" >&2 || exit $?
+    run dotnet msbuild "$csproj" -getProperty:TargetPath -p:Configuration=Release | tr -d '\r\n'
+    echo
+}
+
+cmd_net_trace() {
+    cmdargs "$@"
+    need dotnet-trace "dotnet tool install -g dotnet-trace"
+    mkdir -p "$dir"
+    run dotnet-trace collect --format Speedscope -o "$dir/net-$ts" -- "${CMD[@]}" || exit $?
+    view "$dir/net-$ts.speedscope.json"
+}
+
+cmd_net_counters() {
+    local out="$dir/counters-$ts" file
+    cmdargs "$@"
+    need dotnet-counters "dotnet tool install -g dotnet-counters"
+    mkdir -p "$dir"
+    run dotnet-counters collect --format json -o "$out" --refresh-interval 1 --counters System.Runtime -- "${CMD[@]}" || exit $?
+    [ -n "$PROF_DRY" ] && exit 0
+
+    file="$out.json"
+    [ -f "$file" ] || file=$(ls -1 "$out"* | head -n 1)
+    echo
+    echo "System.Runtime counters from $file (avg and max over the run, one sample per second)"
+    jq -r '[.. | objects | select(has("name") and has("value"))] | group_by(.name)[] |
+           "  \(.[0].name): avg=\((map(.value) | add / length) * 100 | round / 100) max=\(map(.value) | max) last=\(.[-1].value)"' \
+        "$file" 2>/dev/null | head -n 30
+}
+
+cmd_net_gc() {
+    local pid=$1
+    [ -n "$pid" ] || die "usage: prof net-gc PID"
+    need dotnet-gcdump "dotnet tool install -g dotnet-gcdump"
+    mkdir -p "$dir"
+    run dotnet-gcdump collect -p "$pid" -o "$dir/heap-$ts.gcdump" || exit $?
+    run dotnet-gcdump report "$dir/heap-$ts.gcdump" | head -n 30
+}
+
+# --- main --------------------------------------------------------------------------------------
+
+sub=$1
+shift
+
 case $sub in
-    build)
-        src=$1; [ -f "$src" ] || die "usage: prof build FILE.c [OUT]"
-        out=${2:-${src%.c}-prof}
-        # shellcheck disable=SC2086
-        run cc -O2 -g -fno-omit-frame-pointer -std=c2x -Wall -pedantic $CFLAGS "$src" -o "$out" $LDLIBS || exit $?
-        echo "$out"
-        ;;
-    stat)
-        cmdargs "$@"; need perf "sudo dnf install perf"
-        run perf stat -d -r "${PROF_RUNS:-5}" -- "${CMD[@]}"
-        ;;
-    flame|record)
-        cmdargs "$@"; need perf "sudo dnf install perf"; mkdir -p "$dir"
-        data="$dir/perf-$ts.data"; text="$dir/perf-$ts.perf.txt"
-        # --user-callchains: with kernel.perf_event_paranoid=2 (the Fedora default) kernel stacks are not allowed.
-        # cycles:u needs hardware counters; fall back to the software clock (e.g. in a VM).
-        rec() { perf record -F "${PROF_FREQ:-4999}" -e "$1" --call-graph "${PROF_CALLGRAPH:-fp}" --user-callchains -o "$data" -- "${CMD[@]}"; }
-        if [ -n "$PROF_DRY" ]; then echo "+ perf record -F ${PROF_FREQ:-4999} -e ${PROF_EVENT:-cycles:u} --call-graph ${PROF_CALLGRAPH:-fp} --user-callchains -o $data -- ${CMD[*]}"
-        else rec "${PROF_EVENT:-cycles:u}" 2>/dev/null || { echo "prof: cycles:u unavailable, using the software clock" >&2; rec cpu-clock:u; } || exit $?; fi
-        if [ -n "$PROF_DRY" ]; then echo "+ perf script -i $data -F +pid > $text"; else perf script -i "$data" -F +pid > "$text" || exit $?; fi
-        view "$text"
-        echo "other views: prof report (terminal), prof hotspot (GUI)"
-        ;;
-    report)
-        need perf "sudo dnf install perf"
-        data=$(ls -1t "$dir"/perf-*.data 2>/dev/null | head -n 1); [ -n "$data" ] || die "no recording in $dir (run prof flame first)"
-        run perf report -i "$data"
-        ;;
-    hotspot)
-        need hotspot "sudo dnf install hotspot"
-        data=${1:-$(ls -1t "$dir"/perf-*.data 2>/dev/null | head -n 1)}; [ -n "$data" ] || die "no recording in $dir (run prof flame first)"
-        if [ -n "$PROF_DRY" ]; then echo "+ hotspot $data"; else setsid -f hotspot "$data" >/dev/null 2>&1; echo "opened $data in hotspot"; fi
-        ;;
-    callgrind)
-        cmdargs "$@"; need valgrind "sudo dnf install valgrind"; mkdir -p "$dir"
-        out="$dir/callgrind-$ts.out"
-        run valgrind --tool=callgrind --callgrind-out-file="$out" "${CMD[@]}" || exit $?
-        if command -v kcachegrind >/dev/null && [ -z "$PROF_NOVIEW" ] && [ -z "$PROF_DRY" ]; then setsid -f kcachegrind "$out" >/dev/null 2>&1
-        else # no GUI: show the total and the costliest functions
-            run callgrind_annotate "$out" | awk '/PROGRAM TOTALS/ {print} /file:function/ {f=1} f && NF {print} f && !NF {exit}' | head -n 16
-        fi
-        echo "profile: $out"
-        ;;
-    heap)
-        cmdargs "$@"; need heaptrack "sudo dnf install heaptrack"; mkdir -p "$dir"
-        out="$dir/heaptrack-$ts"
-        # --record-only: the plain wrapper opens heaptrack_gui and waits for you to close it
-        run heaptrack --record-only -o "$out" "${CMD[@]}" || exit $?
-        file=$(ls -1 "$out".* 2>/dev/null | head -n 1)
-        [ -n "$PROF_DRY" ] && file="$out.zst"
-        if [ -z "$PROF_DRY" ]; then
-            report=$(heaptrack_print "$file")
-            echo; echo "$report" | tail -n 6
-            echo; echo "most allocations from:"; echo "$report" | sed -n '/MOST CALLS TO ALLOCATION FUNCTIONS/,+8p' | tail -n 8 | cut -c1-110
-        else echo "+ heaptrack_print $file"; fi
-        echo "profile: $file   (GUI: heaptrack_gui $file)"
-        ;;
-    net-build)
-        proj=${1:-.}
-        if [ -d "$proj" ]; then csproj=$(ls "$proj"/*.csproj 2>/dev/null | head -n 1); else csproj=$proj; fi
-        [ -f "$csproj" ] || [ -n "$PROF_DRY" ] || die "no .csproj in $proj"
-        run dotnet build -c Release --nologo -v q "$csproj" >&2 || exit $?
-        run dotnet msbuild "$csproj" -getProperty:TargetPath -p:Configuration=Release | tr -d '\r\n'; echo
-        ;;
-    net-trace)
-        cmdargs "$@"; need dotnet-trace "dotnet tool install -g dotnet-trace"; mkdir -p "$dir"
-        run dotnet-trace collect --format Speedscope -o "$dir/net-$ts" -- "${CMD[@]}" || exit $?
-        view "$dir/net-$ts.speedscope.json"
-        ;;
-    net-counters)
-        cmdargs "$@"; need dotnet-counters "dotnet tool install -g dotnet-counters"; mkdir -p "$dir"
-        out="$dir/counters-$ts"
-        run dotnet-counters collect --format json -o "$out" --refresh-interval 1 --counters System.Runtime -- "${CMD[@]}" || exit $?
-        [ -n "$PROF_DRY" ] && exit 0
-        file="$out.json"; [ -f "$file" ] || file=$(ls -1 "$out"* | head -n 1)
-        echo; echo "System.Runtime counters from $file (avg and max over the run, one sample per second)"
-        jq -r '[.. | objects | select(has("name") and has("value"))] | group_by(.name)[] |
-               "  \(.[0].name): avg=\((map(.value) | add / length) * 100 | round / 100) max=\(map(.value) | max) last=\(.[-1].value)"' "$file" 2>/dev/null | head -n 30
-        ;;
-    net-gc)
-        pid=$1; [ -n "$pid" ] || die "usage: prof net-gc PID"; need dotnet-gcdump "dotnet tool install -g dotnet-gcdump"; mkdir -p "$dir"
-        run dotnet-gcdump collect -p "$pid" -o "$dir/heap-$ts.gcdump" || exit $?
-        run dotnet-gcdump report "$dir/heap-$ts.gcdump" | head -n 30
-        ;;
+    build)        cmd_build "$@" ;;
+    stat)         cmd_stat "$@" ;;
+    flame|record) cmd_flame "$@" ;;
+    report)       cmd_report ;;
+    hotspot)      cmd_hotspot "$@" ;;
+    callgrind)    cmd_callgrind "$@" ;;
+    heap)         cmd_heap "$@" ;;
+    net-build)    cmd_net_build "$@" ;;
+    net-trace)    cmd_net_trace "$@" ;;
+    net-counters) cmd_net_counters "$@" ;;
+    net-gc)       cmd_net_gc "$@" ;;
     ""|-h|--help|help) usage ;;
     *) die "unknown command '$sub' (prof --help)" ;;
 esac
