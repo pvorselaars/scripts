@@ -1,0 +1,109 @@
+#!/bin/bash
+# audio-menu: pick the audio output (speakers, headphones, ...) and the microphone in fuzzel.
+# The device that is the default now has a dot. Picking another one makes it the default (wpctl),
+# and WirePlumber moves the running streams along.
+#
+#   audio-menu            outputs and microphones
+#   audio-menu out        only the outputs
+#   audio-menu in         only the microphones
+#   audio-menu --print    list the entries without showing the menu (can be combined with out / in)
+
+ICON_SPEAKER=$'\U000F04C3'      # nf-md-speaker
+ICON_HEADPHONES=$'\U000F02CB'   # nf-md-headphones
+ICON_MIC=$'\U000F036C'          # nf-md-microphone
+DEFAULT_MARK="●"
+
+menu() { fuzzel --dmenu --index --prompt "$1" --width 64 --lines 10; }
+say() { notify-send -a audio "$@"; }
+
+# default_id sink|source: the node id of the current default device (empty when there is none)
+default_id() {
+    wpctl inspect "@DEFAULT_AUDIO_${1^^}@" 2>/dev/null | sed -n '1s/^id \([0-9]*\),.*/\1/p'
+}
+
+# nodes sink|source: one line per device: id, a tab, and its description. Virtual devices
+# (filters, loopbacks) are included, because those are often the ones you want to pick.
+nodes() {
+    local class="Audio/${1^}"
+    pw-dump 2>/dev/null | jq -r --arg class "$class" '
+        .[] | select(.type == "PipeWire:Interface:Node")
+        | select((.info.props["media.class"] // "") | . == $class or . == ($class + "/Virtual"))
+        | [.id, (.info.props["node.description"] // .info.props["node.name"])] | @tsv'
+}
+
+# output_icon DESCRIPTION: headphones for headsets and earbuds, a speaker for the rest
+output_icon() {
+    case ${1,,} in
+        *headphone*|*headset*|*earbud*|*buds*|*airpods*) echo "$ICON_HEADPHONES" ;;
+        *) echo "$ICON_SPEAKER" ;;
+    esac
+}
+
+entries=()   # what the menu shows
+actions=()   # what picking an entry does, at the same index: kind:id:description
+add() { entries+=("$1"); actions+=("$2"); }
+
+# add_devices sink|source: one entry per device of that kind, the default one marked
+add_devices() {
+    local kind=$1 default id description icon label
+    default=$(default_id "$kind")
+
+    while IFS=$'\t' read -r id description; do
+        [ -n "$id" ] || continue
+        if [ "$kind" = sink ]; then
+            icon=$(output_icon "$description")
+        else
+            icon=$ICON_MIC
+        fi
+        label="$icon $description"
+        [ "$id" = "$default" ] && label+="  $DEFAULT_MARK"
+        add "$label" "$kind:$id:$description"
+    done < <(nodes "$kind")
+}
+
+# --- options -------------------------------------------------------------------------------------
+
+print_only=0
+want_out=1
+want_in=1
+for arg in "$@"; do
+    case $arg in
+        --print) print_only=1 ;;
+        out) want_in=0 ;;
+        in)  want_out=0 ;;
+        *) echo "usage: audio-menu [--print] [out|in]" >&2; exit 2 ;;
+    esac
+done
+
+[ "$want_out" = 1 ] && add_devices sink
+[ "$want_in" = 1 ] && add_devices source
+
+if [ "$print_only" = 1 ]; then
+    printf '%s\n' "${entries[@]}"
+    exit 0
+fi
+
+if [ "${#entries[@]}" -eq 0 ]; then
+    say "No audio devices found"
+    exit 0
+fi
+
+# --- pick and apply ------------------------------------------------------------------------------
+
+choice=$(printf '%s\n' "${entries[@]}" | menu 'audio> ') || exit 0
+action=${actions[$choice]}
+kind=${action%%:*}
+details=${action#*:}        # id:description, and the description may contain colons
+id=${details%%:*}
+description=${details#*:}
+
+if wpctl set-default "$id"; then
+    if [ "$kind" = sink ]; then
+        say "Output: $description"
+    else
+        say "Microphone: $description"
+    fi
+    ~/.local/bin/statusbar-refresh      # the volume of the new device may be different
+else
+    say -u critical "Could not switch to $description"
+fi
