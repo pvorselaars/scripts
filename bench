@@ -8,72 +8,122 @@
 # Results: .bench/LABEL-TIMESTAMP.json in the current directory (BENCH_DIR overrides).
 # Defaults: 3 warmup runs, at least 10 timed runs. A change counts as real when it is larger
 # than twice the combined standard error of both runs.
+
 export PATH="$HOME/.local/bin:$HOME/.dotnet/tools:$PATH"
 dir=${BENCH_DIR:-.bench}
 
-usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+# the comment block at the top of this file, without the "# "
+usage() { sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//'; }
+
+# Reads one tab-separated line per command:
+#   command, old mean, old stddev, old runs, new mean, new stddev, new runs   (times in seconds)
+# and prints how the new run compares with the old one.
+COMPARE_AWK='
+    # seconds -> "850.0 µs" / "12.50 ms" / "1.250 s"
+    function format(seconds) {
+        if (seconds < 1e-3) return sprintf("%.1f µs", seconds * 1e6)
+        if (seconds < 1)    return sprintf("%.2f ms", seconds * 1e3)
+        return sprintf("%.3f s", seconds)
+    }
+    {
+        old_mean = $2; old_sd = $3; old_runs = $4
+        new_mean = $5; new_sd = $6; new_runs = $7
+
+        change = (new_mean - old_mean) / old_mean * 100
+        standard_error = sqrt(old_sd * old_sd / old_runs + new_sd * new_sd / new_runs)
+        difference = new_mean - old_mean
+        if (difference < 0) difference = -difference
+
+        if (difference > 2 * standard_error)
+            verdict = (change < 0 ? "FASTER" : "SLOWER") " (real, beyond noise)"
+        else
+            verdict = "no significant change"
+
+        printf "  %-30.30s %s ± %s  (was %s ± %s)  %+.1f%%  %s\n",
+            $1, format(new_mean), format(new_sd), format(old_mean), format(old_sd), change, verdict
+    }'
 
 # compare OLD.json NEW.json: one line per command
 compare() {
-    local old=$1 new=$2 n i
-    n=$(jq -s '[(.[0].results | length), (.[1].results | length)] | min' "$old" "$new")
+    local old=$1 new=$2 count i
+    count=$(jq -s '[(.[0].results | length), (.[1].results | length)] | min' "$old" "$new")
     echo "compared with $(basename "$old") (git: $(jq -r '.git // "?"' "$old"))"
-    for ((i = 0; i < n; i++)); do
-        jq -rs --argjson i "$i" '.[0].results[$i] as $o | .[1].results[$i] as $n |
-            [$n.command, $o.mean, $o.stddev, ($o.times | length), $n.mean, $n.stddev, ($n.times | length)] | @tsv' "$old" "$new" |
-        awk -F'\t' '
-            function fmt(s) { return s < 1e-3 ? sprintf("%.1f µs", s * 1e6) : s < 1 ? sprintf("%.2f ms", s * 1e3) : sprintf("%.3f s", s) }
-            {
-                delta = ($5 - $2) / $2 * 100
-                se = sqrt($3 * $3 / $4 + $6 * $6 / $7)
-                diff = $5 - $2; if (diff < 0) diff = -diff
-                if (diff > 2 * se) verdict = (delta < 0 ? "FASTER" : "SLOWER") " (real, beyond noise)"
-                else verdict = "no significant change"
-                printf "  %-30.30s %s ± %s  (was %s ± %s)  %+.1f%%  %s\n", $1, fmt($5), fmt($6), fmt($2), fmt($3), delta, verdict
-            }'
+    for ((i = 0; i < count; i++)); do
+        jq -rs --argjson i "$i" '
+            .[0].results[$i] as $old | .[1].results[$i] as $new |
+            [$new.command, $old.mean, $old.stddev, ($old.times | length),
+             $new.mean, $new.stddev, ($new.times | length)] | @tsv' "$old" "$new" |
+            awk -F'\t' "$COMPARE_AWK"
     done
 }
 
-newest() { ls -1 "$dir"/"$1"-[0-9]*.json 2>/dev/null | sort | tail -n "${2:-1}"; }
+# newest LABEL [COUNT]: the COUNT newest result files of LABEL (default 1), oldest first
+newest() {
+    ls -1 "$dir"/"$1"-[0-9]*.json 2>/dev/null | sort | tail -n "${2:-1}"
+}
 
-if [ "$1" = -h ] || [ "$1" = --help ]; then usage; exit 0; fi
-
-if [ "$1" = -c ]; then
-    label=$2
+# bench -c [LABEL]: compare the two newest runs of a label, without running anything
+compare_newest() {
+    local label=$1 newest_file two
     if [ -z "$label" ]; then
-        f=$(ls -1t "$dir"/*.json 2>/dev/null | head -n 1)
-        [ -n "$f" ] || { echo "bench: no results in $dir" >&2; exit 1; }
-        label=$(jq -r '.label' "$f")
+        newest_file=$(ls -1t "$dir"/*.json 2>/dev/null | head -n 1)
+        [ -n "$newest_file" ] || { echo "bench: no results in $dir" >&2; exit 1; }
+        label=$(jq -r '.label' "$newest_file")
     fi
     mapfile -t two < <(newest "$label" 2)
     [ "${#two[@]}" -eq 2 ] || { echo "bench: need two runs of '$label' in $dir to compare" >&2; exit 1; }
     compare "${two[0]}" "${two[1]}"
+}
+
+# run_benchmark LABEL COMMAND...: time the commands, save the result and compare with the previous run
+run_benchmark() {
+    local label=$1 previous file git_id tmp
+    shift
+    command -v hyperfine >/dev/null || { echo "bench: hyperfine not found (sudo dnf install hyperfine)" >&2; exit 127; }
+
+    if [ -z "$label" ]; then
+        local last=${!#}                    # the command is the last argument
+        label=$(basename "${last%% *}")     # named after its first word
+    fi
+    mkdir -p "$dir"
+    previous=$(newest "$label" 1)
+    file="$dir/$label-$(date +%Y%m%d-%H%M%S).json"
+
+    hyperfine --warmup 3 --min-runs 10 --style basic --export-json "$file" "$@" || exit $?
+
+    # remember which commit was measured ("+dirty" when there are uncommitted changes)
+    git_id=$(git rev-parse --short HEAD 2>/dev/null)
+    [ -n "$git_id" ] && [ -n "$(git status --porcelain 2>/dev/null)" ] && git_id="$git_id+dirty"
+    tmp=$(mktemp)
+    jq --arg label "$label" --arg git "${git_id:-none}" '. + {label: $label, git: $git}' "$file" > "$tmp" && mv "$tmp" "$file"
+
+    echo
+    echo "saved $file"
+    if [ -n "$previous" ]; then
+        compare "$previous" "$file"
+    else
+        echo "(first run for '$label': nothing to compare with yet)"
+    fi
+}
+
+if [ "$1" = -h ] || [ "$1" = --help ]; then
+    usage
     exit 0
 fi
 
-label=""; args=()
+if [ "$1" = -c ]; then
+    compare_newest "$2"
+    exit 0
+fi
+
+label=""
+args=()
 while [ $# -gt 0 ]; do
     case $1 in
         -l) label=$2; shift 2 ;;
-        *) args+=("$1"); shift ;;
+        *)  args+=("$1"); shift ;;
     esac
 done
 [ "${#args[@]}" -gt 0 ] || { usage; exit 1; }
-command -v hyperfine >/dev/null || { echo "bench: hyperfine not found (sudo dnf install hyperfine)" >&2; exit 127; }
 
-if [ -z "$label" ]; then
-    last=${args[${#args[@]} - 1]}      # the command is the last argument
-    label=$(basename "${last%% *}")
-fi
-mkdir -p "$dir"
-prev=$(newest "$label" 1)
-file="$dir/$label-$(date +%Y%m%d-%H%M%S).json"
-
-hyperfine --warmup 3 --min-runs 10 --style basic --export-json "$file" "${args[@]}" || exit $?
-
-git_id=$(git rev-parse --short HEAD 2>/dev/null)
-[ -n "$git_id" ] && [ -n "$(git status --porcelain 2>/dev/null)" ] && git_id="$git_id+dirty"
-tmp=$(mktemp); jq --arg l "$label" --arg g "${git_id:-none}" '. + {label: $l, git: $g}' "$file" > "$tmp" && mv "$tmp" "$file"
-
-echo; echo "saved $file"
-[ -n "$prev" ] && compare "$prev" "$file" || echo "(first run for '$label': nothing to compare with yet)"
+run_benchmark "$label" "${args[@]}"
