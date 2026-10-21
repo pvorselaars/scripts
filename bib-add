@@ -6,30 +6,50 @@
 # Shows the entry first and asks before appending (--yes skips the question, --dry-run only shows it).
 # A search result is added in its cover edition, which may not be the edition you own: use the ISBN for that.
 # %K is the keywords you give, or the title in lower case. Then refer2bib regenerates references.bib.
+
 here=${BIBLIOGRAPHY:-$HOME/Projects/bibliography}   # the project with `references` and refer2bib
 refs="$here/references"
 usage="usage: bib-add [--yes] [--dry-run] ISBN [keywords...]
        bib-add [--yes] [--dry-run] [--first] -s \"title author\" [keywords...]"
 
-yes=0; dry=0; first=0; query=""
+# --- options -----------------------------------------------------------------------------------
+
+yes=0
+dry=0
+first=0
+query=""
 while [[ ${1:-} == -* ]]; do
     case $1 in
-        --yes) yes=1 ;;
+        --yes)     yes=1 ;;
         --dry-run) dry=1 ;;
-        --first) first=1 ;;   # take the top search result without asking
-        -s) shift; query=${1:-}; [ -n "$query" ] || { echo "$usage" >&2; exit 2; } ;;
+        --first)   first=1 ;;    # take the top search result without asking
+        -s)
+            shift
+            query=${1:-}
+            [ -n "$query" ] || { echo "$usage" >&2; exit 2; }
+            ;;
         *) echo "bib-add: unknown option $1" >&2; exit 2 ;;
     esac
     shift
 done
 
-if [ -n "$query" ]; then
-    keywords="$*"
+# --- finding the book --------------------------------------------------------------------------
+
+# Statuses of search_edition besides 0 (picked) and 1 (error): the function runs inside $(...), where
+# `exit` would only leave the subshell, so these tell the main part how to stop.
+PICK_CANCELLED=10    # closed the picker: stop quietly
+PICK_INVALID=11      # typed no valid number: say "not added"
+
+# search_edition QUERY: let the user pick a result; prints the Open Library edition id of the pick
+search_edition() {
+    local query=$1 result list pick n
+
     result=$(curl -fsS -m 15 -G "https://openlibrary.org/search.json" \
         --data-urlencode "q=$query" --data-urlencode "limit=15" \
         --data-urlencode "fields=title,author_name,first_publish_year,edition_count,cover_edition_key") \
         || { echo "bib-add: could not reach Open Library" >&2; exit 1; }
-    # one line per result: edition id <tab> label
+
+    # one line per result: edition id, a tab, and the label shown in the list
     list=$(jq -r '.docs[] | select(.cover_edition_key)
         | "\(.cover_edition_key)\t\(.title) — \((.author_name // ["?"])[:2] | join(", ")) (\(.first_publish_year // "?"), \(.edition_count) editions)"' <<< "$result")
     [ -n "$list" ] || { echo "bib-add: nothing found for '$query'" >&2; exit 1; }
@@ -37,40 +57,66 @@ if [ -n "$query" ]; then
     if [ "$first" = 1 ] || [ "$(wc -l <<< "$list")" -eq 1 ]; then
         pick=$(head -1 <<< "$list")
     elif command -v fzf >/dev/null && [ -t 0 ]; then
-        pick=$(fzf --delimiter '\t' --with-nth 2 --prompt 'book> ' <<< "$list") || exit 0
+        pick=$(fzf --delimiter '\t' --with-nth 2 --prompt 'book> ' <<< "$list") || return $PICK_CANCELLED
     else
         cut -f2 <<< "$list" | nl -w2 -s'. ' >&2
         read -r -p "Number: " n
+        [[ $n =~ ^[0-9]+$ ]] || return $PICK_INVALID      # sed would read anything else as a command
         pick=$(sed -n "${n}p" <<< "$list")
-        [ -n "$pick" ] || { echo "not added"; exit 0; }
+        [ -n "$pick" ] || return $PICK_INVALID
     fi
-    bibkey="OLID:${pick%%$'\t'*}"
+    echo "${pick%%$'\t'*}"
+}
+
+# fetch_book BIBKEY: the Open Library record (JSON) for "ISBN:..." or "OLID:..."
+fetch_book() {
+    local bibkey=$1 json
+    json=$(curl -fsS -m 15 "https://openlibrary.org/api/books?bibkeys=$bibkey&format=json&jscmd=data") \
+        || { echo "bib-add: could not reach Open Library" >&2; exit 1; }
+    [ "$(jq -r --arg k "$bibkey" 'has($k)' <<< "$json")" = true ] \
+        || { echo "bib-add: Open Library does not know $bibkey" >&2; exit 1; }
+    echo "$json"
+}
+
+# refer_entry BIBKEY KEYWORDS: the record in `references` format (only the fields that exist)
+refer_entry() {
+    jq -r --arg k "$1" --arg kw "$2" '
+        .[$k] as $b
+        | ($b.title + (if $b.subtitle then ": " + $b.subtitle else "" end)) as $title
+        | [ "%K " + (if $kw != "" then $kw else ($title | ascii_downcase) end) ]
+          + [ ($b.authors // [])[] | "%A " + .name ]
+          + [ "%T " + $title ]
+          + (if ($b.publishers // []) | length > 0 then ["%I " + $b.publishers[0].name] else [] end)
+          + (if ($b.publish_places // []) | length > 0 then ["%C " + $b.publish_places[0].name] else [] end)
+          + (if ($b.publish_date // "") | test("[0-9]{4}") then ["%D " + ($b.publish_date | capture("(?<y>[0-9]{4})").y)] else [] end)
+        | .[]'
+}
+
+# --- main --------------------------------------------------------------------------------------
+
+if [ -n "$query" ]; then
+    keywords="$*"
+    edition=$(search_edition "$query")
+    case $? in
+        0) ;;
+        "$PICK_CANCELLED") exit 0 ;;
+        "$PICK_INVALID") echo "not added"; exit 0 ;;
+        *) exit 1 ;;
+    esac
+    bibkey="OLID:$edition"
 else
     [ $# -ge 1 ] || { echo "$usage" >&2; exit 2; }
-    isbn=${1//[- ]/}; shift
+    isbn=${1//[- ]/}
+    shift
     [[ $isbn =~ ^([0-9]{9}[0-9Xx]|[0-9]{13})$ ]] || { echo "bib-add: '$isbn' is not an ISBN-10 or ISBN-13 (use -s to search)" >&2; exit 2; }
     keywords="$*"
     bibkey="ISBN:$isbn"
 fi
 
-json=$(curl -fsS -m 15 "https://openlibrary.org/api/books?bibkeys=$bibkey&format=json&jscmd=data") \
-    || { echo "bib-add: could not reach Open Library" >&2; exit 1; }
-[ "$(jq -r --arg k "$bibkey" 'has($k)' <<< "$json")" = true ] \
-    || { echo "bib-add: Open Library does not know $bibkey" >&2; exit 1; }
-
-entry=$(jq -r --arg k "$bibkey" --arg kw "$keywords" '
-    .[$k] as $b
-    | ($b.title + (if $b.subtitle then ": " + $b.subtitle else "" end)) as $title
-    | [ "%K " + (if $kw != "" then $kw else ($title | ascii_downcase) end) ]
-      + [ ($b.authors // [])[] | "%A " + .name ]
-      + [ "%T " + $title ]
-      + (if ($b.publishers // []) | length > 0 then ["%I " + $b.publishers[0].name] else [] end)
-      + (if ($b.publish_places // []) | length > 0 then ["%C " + $b.publish_places[0].name] else [] end)
-      + (if ($b.publish_date // "") | test("[0-9]{4}") then ["%D " + ($b.publish_date | capture("(?<y>[0-9]{4})").y)] else [] end)
-    | .[]' <<< "$json")
-
+entry=$(fetch_book "$bibkey" | refer_entry "$bibkey" "$keywords")
 echo "$entry"
 echo
+
 title=$(sed -n 's/^%T //p' <<< "$entry")
 if grep -qixF "%T $title" "$refs"; then
     echo "bib-add: '$title' is already in references" >&2
@@ -85,6 +131,7 @@ if [ "$yes" != 1 ]; then
     [[ $answer == [yY]* ]] || { echo "not added"; exit 0; }
 fi
 
+# do not glue the entry onto a last line that has no trailing newline
 [ -n "$(tail -c1 "$refs")" ] && echo >> "$refs"
 { echo; echo "$entry"; } >> "$refs"
 "$here/refer2bib" 2>&1 | grep -v "note:" | tail -3
