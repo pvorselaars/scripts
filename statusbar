@@ -1,8 +1,14 @@
 #!/bin/bash
-# swaybar status line. Modules that only matter sometimes stay hidden until they do:
-#   REC while recording, a presentation icon in presentation mode, the playing track, do-not-disturb, cpu/ram/disk when high, battery when low, brightness and volume for a few seconds
-#   after a change, a power profile icon unless it is balanced, network when there is traffic, bluetooth while a device is connected,
-#   wifi only while offline.
+# statusbar: swaybar status line.
+#
+# Modules that only matter sometimes stay hidden until they do:
+#   - REC while recording, a presentation icon in presentation mode, do-not-disturb
+#   - the playing track
+#   - cpu, ram and disk when high; battery when low
+#   - brightness and volume for a few seconds after a change
+#   - a power profile icon, unless it is balanced
+#   - network when there is traffic, bluetooth while a device is connected
+#   - wifi only while offline
 # Send SIGUSR1 (see statusbar-refresh) to redraw immediately.
 # `statusbar-refresh all` shows every module for a few seconds (toggle).
 #
@@ -21,18 +27,48 @@
 export LC_ALL=C.UTF-8   # so the track title is cut on characters, not bytes
 shopt -u patsub_replacement 2>/dev/null   # bash 5.2: '&' in a ${var//a/b} replacement would mean "the match"
 
-esc() { REPLY=${1//&/&amp;}; REPLY=${REPLY//</&lt;}; REPLY=${REPLY//>/&gt;}; }   # markup-safe text -> $REPLY
-
 # Colours: One Dark Darker, same as ~/.config/sway/config. Needs `pango_markup enabled` in the bar.
-RED='#e55561'; ORANGE='#f0a45d'; GREEN='#8ebd6b'; YELLOW='#e2b86b'; BLUE='#4fa6ed'; CYAN='#48b0bd'; PURPLE='#bf68d9'; DIM='#7a818e'
-paint() { printf -v res '<span foreground="%s">%s</span>' "$1" "$2"; }   # paint COLOR TEXT -> $res
+RED='#e55561'
+ORANGE='#f0a45d'
+GREEN='#8ebd6b'
+YELLOW='#e2b86b'
+BLUE='#4fa6ed'
+CYAN='#48b0bd'
+PURPLE='#bf68d9'
+DIM='#7a818e'
+
+# The gap between modules is a span of its own: plain spaces between two icons are drawn
+# from the symbols font, where a space is a dot.
+GAP='<span font_family="JetBrains Mono">  </span>'
+
+# markup-safe text -> $REPLY
+esc() {
+    REPLY=${1//&/&amp;}
+    REPLY=${REPLY//</&lt;}
+    REPLY=${REPLY//>/&gt;}
+}
+
+# paint COLOR TEXT -> $res
+paint() { printf -v res '<span foreground="%s">%s</span>' "$1" "$2"; }
+
+# --- state kept between refreshes ------------------------------------------------------------
 
 showall_file="${XDG_RUNTIME_DIR:-/tmp}/statusbar.showall"   # holds the epoch time to stop showing everything
-
 pidfile="${XDG_RUNTIME_DIR:-/tmp}/statusbar.pid"
-echo $$ > "$pidfile"
+
 poke=0
-trap 'poke=1' USR1   # remembered, so a signal during a redraw is not lost
+trap 'poke=1' USR1    # remembered, so a signal during a redraw is not lost
+
+last_bright=""
+bright_until=0
+last_vol=""
+vol_until=0
+rx_rate=0
+tx_rate=0
+
+# --- lifecycle -------------------------------------------------------------------------------
+
+echo $$ > "$pidfile"
 
 # redraw when a player changes track or play state (playerctl blocks until something changes)
 follower=""
@@ -41,37 +77,61 @@ if command -v playerctl >/dev/null; then
         while read -r _; do kill -USR1 $$ 2>/dev/null; done; } &
     follower=$!
 fi
-trap '[ "$(cat "$pidfile" 2>/dev/null)" = "$$" ] && rm -f "$pidfile"; [ -n "$follower" ] && { pkill -P "$follower" 2>/dev/null; kill "$follower" 2>/dev/null; }' EXIT
+
+# remove our pidfile (unless a newer instance has taken it over) and stop the player watcher
+cleanup() {
+    [ "$(cat "$pidfile" 2>/dev/null)" = "$$" ] && rm -f "$pidfile"
+    if [ -n "$follower" ]; then
+        pkill -P "$follower" 2>/dev/null
+        kill "$follower" 2>/dev/null
+    fi
+}
+trap cleanup EXIT
+
+# --- samples -----------------------------------------------------------------------------------
 
 bright() { timeout 1 brightnessctl -c backlight -m 2>/dev/null | cut -d, -f4; }
 
+# sets cur_total and cur_idle: cpu time since boot, all and idle
 cpu_sample() {
-    local _ u n s i w q sq st
-    read -r _ u n s i w q sq st _ < /proc/stat
-    cur_total=$((u + n + s + i + w + q + sq + st))
-    cur_idle=$((i + w))
+    local _ user nice system idle iowait irq softirq steal
+    read -r _ user nice system idle iowait irq softirq steal _ < /proc/stat
+    cur_total=$((user + nice + system + idle + iowait + irq + softirq + steal))
+    cur_idle=$((idle + iowait))
+}
+
+# sets net_rx, net_tx (bytes since boot, all real interfaces) and net_t (microseconds)
+net_sample() {
+    read -r net_rx net_tx < <(awk '
+        /:/ {
+            split($0, parts, ":")
+            name = parts[1]; gsub(/ /, "", name)
+            if (name !~ /^(lo|docker|veth|br-|virbr)/) {
+                split(parts[2], fields, " ")
+                rx += fields[1]; tx += fields[9]
+            }
+        }
+        END { print rx + 0, tx + 0 }' /proc/net/dev)
+    net_t=${EPOCHREALTIME/./}
 }
 
 last_bright=$(bright)
-bright_until=0
-last_vol=""
-vol_until=0
 cpu_sample; prev_total=$cur_total; prev_idle=$cur_idle
-
-net_sample() {   # sets net_rx, net_tx (bytes since boot, all real interfaces) and net_t (microseconds)
-    read -r net_rx net_tx < <(awk '/:/ {split($0, a, ":"); name = a[1]; gsub(/ /, "", name); if (name !~ /^(lo|docker|veth|br-|virbr)/) {split(a[2], f, " "); rx += f[1]; tx += f[9]}} END {print rx + 0, tx + 0}' /proc/net/dev)
-    net_t=${EPOCHREALTIME/./}
-}
 net_sample; prev_rx=$net_rx; prev_tx=$net_tx; prev_t=$net_t
-rx_rate=0; tx_rate=0
 
-fmt_rate() {   # bytes/s -> 0B / 12K / 1.4M
-    local r=$1
-    if [ "$r" -ge 1048576 ]; then echo "$((r * 10 / 1048576 / 10)).$((r * 10 / 1048576 % 10))M"
-    elif [ "$r" -ge 1024 ]; then echo "$((r / 1024))K"
-    else echo "${r}B"
+# bytes/s -> 0B / 12K / 1.4M
+fmt_rate() {
+    local rate=$1
+    if [ "$rate" -ge 1048576 ]; then
+        echo "$((rate * 10 / 1048576 / 10)).$((rate * 10 / 1048576 % 10))M"
+    elif [ "$rate" -ge 1024 ]; then
+        echo "$((rate / 1024))K"
+    else
+        echo "${rate}B"
     fi
 }
+
+# --- modules: each one sets $res, or leaves it empty to stay hidden ----------------------------
 
 media() {
     local line status artist title text icon
@@ -81,13 +141,16 @@ media() {
         line=$(timeout 1 playerctl --all-players metadata --format '{{status}}|{{artist}}|{{title}}' 2>/dev/null | grep -m1 '^Paused|')
     fi
     [ -n "$line" ] || return
+
     status=${line%%|*}; line=${line#*|}
     artist=${line%%|*}; title=${line#*|}
     text=$title
     [ -n "$artist" ] && text="$artist - $title"
     [ "${#text}" -gt "$MEDIA_MAX" ] && text="${text:0:$((MEDIA_MAX - 1))}…"
     esc "$text"; text=$REPLY
-    icon=󰎆; [ "$status" = Paused ] && icon=󰏤
+
+    icon=󰎆
+    [ "$status" = Paused ] && icon=󰏤
     paint "$ORANGE" "$icon $text"
 }
 
@@ -104,68 +167,91 @@ dnd() {
 }
 
 cpu() {
-    local pct dt
+    local percent total_diff color
     cpu_sample
-    dt=$((cur_total - prev_total))
-    pct=0
-    [ "$dt" -gt 0 ] && pct=$(( 100 * (dt - (cur_idle - prev_idle)) / dt ))
-    prev_total=$cur_total; prev_idle=$cur_idle
-    if [ "$all" = 1 ] || [ "$pct" -ge "$CPU_HIGH" ]; then
-        col=$CYAN; [ "$pct" -ge "$CPU_HIGH" ] && col=$RED
-        paint "$col" "󰍛 $pct%"
+    total_diff=$((cur_total - prev_total))
+    percent=0
+    [ "$total_diff" -gt 0 ] && percent=$(( 100 * (total_diff - (cur_idle - prev_idle)) / total_diff ))
+    prev_total=$cur_total
+    prev_idle=$cur_idle
+
+    if [ "$all" = 1 ] || [ "$percent" -ge "$CPU_HIGH" ]; then
+        color=$CYAN
+        [ "$percent" -ge "$CPU_HIGH" ] && color=$RED
+        paint "$color" "󰍛 $percent%"
     fi
 }
 
 mem() {
-    local pct
-    pct=$(awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {printf "%d", 100 * (t - a) / t}' /proc/meminfo)
-    if [ "$all" = 1 ] || [ "$pct" -ge "$MEM_HIGH" ]; then
-        col=$PURPLE; [ "$pct" -ge "$MEM_HIGH" ] && col=$RED
-        paint "$col" "󰘚 $pct%"
+    local percent color
+    percent=$(awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {printf "%d", 100 * (t - a) / t}' /proc/meminfo)
+
+    if [ "$all" = 1 ] || [ "$percent" -ge "$MEM_HIGH" ]; then
+        color=$PURPLE
+        [ "$percent" -ge "$MEM_HIGH" ] && color=$RED
+        paint "$color" "󰘚 $percent%"
     fi
 }
 
+# shown for SHOW_CHANGE seconds after the brightness changes
 brightness() {
-    local now cur
+    local now current
     now=$(date +%s)
-    cur=$(bright)
-    if [ -n "$cur" ] && [ "$cur" != "$last_bright" ]; then
-        last_bright=$cur
+    current=$(bright)
+    if [ -n "$current" ] && [ "$current" != "$last_bright" ]; then
+        last_bright=$current
         bright_until=$((now + SHOW_CHANGE))
     fi
-    { [ "$all" = 1 ] || [ "$now" -lt "$bright_until" ]; } && paint "$YELLOW" "󰃟 $cur"
+
+    if [ "$all" = 1 ] || [ "$now" -lt "$bright_until" ]; then
+        paint "$YELLOW" "󰃟 $current"
+    fi
 }
 
 disk() {
-    local pct
-    pct=$(timeout 1 df --output=pcent / 2>/dev/null | tail -1 | tr -dc '0-9')
-    [ -n "$pct" ] || return
-    if [ "$all" = 1 ] || [ "$pct" -ge "$DISK_HIGH" ]; then
-        col=$YELLOW; [ "$pct" -ge "$DISK_HIGH" ] && col=$RED
-        paint "$col" "󰋊 $pct%"
+    local percent color
+    percent=$(timeout 1 df --output=pcent / 2>/dev/null | tail -1 | tr -dc '0-9')
+    [ -n "$percent" ] || return
+
+    if [ "$all" = 1 ] || [ "$percent" -ge "$DISK_HIGH" ]; then
+        color=$YELLOW
+        [ "$percent" -ge "$DISK_HIGH" ] && color=$RED
+        paint "$color" "󰋊 $percent%"
+    fi
+}
+
+# measures rx_rate and tx_rate in bytes/s since the previous measurement
+update_net_rates() {
+    local elapsed
+    net_sample
+    elapsed=$((net_t - prev_t))
+
+    # keep the previous rates if redraws come in too fast to measure
+    if [ "$elapsed" -ge 500000 ]; then
+        rx_rate=$(( (net_rx - prev_rx) * 1000000 / elapsed ))
+        [ "$rx_rate" -lt 0 ] && rx_rate=0
+        tx_rate=$(( (net_tx - prev_tx) * 1000000 / elapsed ))
+        [ "$tx_rate" -lt 0 ] && tx_rate=0
+        prev_rx=$net_rx
+        prev_tx=$net_tx
+        prev_t=$net_t
     fi
 }
 
 net() {
-    local dt
-    net_sample
-    dt=$((net_t - prev_t))
-    # keep the previous rates if redraws come in too fast to measure
-    if [ "$dt" -ge 500000 ]; then
-        rx_rate=$(( (net_rx - prev_rx) * 1000000 / dt )); [ "$rx_rate" -lt 0 ] && rx_rate=0
-        tx_rate=$(( (net_tx - prev_tx) * 1000000 / dt )); [ "$tx_rate" -lt 0 ] && tx_rate=0
-        prev_rx=$net_rx; prev_tx=$net_tx; prev_t=$net_t
-    fi
-    if [ "$all" = 1 ] || [ "$rx_rate" -ge $((NET_MIN * 1024)) ] || [ "$tx_rate" -ge $((NET_MIN * 1024)) ]; then
+    local threshold=$((NET_MIN * 1024))
+    update_net_rates
+
+    if [ "$all" = 1 ] || [ "$rx_rate" -ge "$threshold" ] || [ "$tx_rate" -ge "$threshold" ]; then
         printf -v res '<span foreground="%s">󰇚 %s</span> <span foreground="%s">󰕒 %s</span>' \
             "$GREEN" "$(fmt_rate "$rx_rate")" "$BLUE" "$(fmt_rate "$tx_rate")"
     fi
 }
 
 profile() {
-    local p
-    p=$(busctl --system get-property net.hadess.PowerProfiles /net/hadess/PowerProfiles net.hadess.PowerProfiles ActiveProfile 2>/dev/null | cut -d'"' -f2)
-    case $p in
+    local active
+    active=$(busctl --system get-property net.hadess.PowerProfiles /net/hadess/PowerProfiles net.hadess.PowerProfiles ActiveProfile 2>/dev/null | cut -d'"' -f2)
+    case $active in
         power-saver) paint "$GREEN" "󰌪" ;;
         performance) paint "$ORANGE" "󰓅" ;;
         balanced)    [ "$all" = 1 ] && paint "$DIM" "󰾅" ;;
@@ -173,92 +259,139 @@ profile() {
 }
 
 battery() {
-    local out pct
-    out=$("$HOME/Projects/scripts/battery") || return
-    pct=${out##* }; pct=${pct%\%}
-    if [ "$all" = 1 ] || [ "$pct" -le "$BAT_LOW" ]; then
-        col=$GREEN
-        [ "$pct" -le 50 ] && col=$YELLOW
-        [ "$pct" -le "$BAT_LOW" ] && col=$RED
-        [[ $out == 󰂄* ]] && col=$GREEN   # charging
-        paint "$col" "$out"
+    local status percent color
+    status=$("$HOME/Projects/scripts/battery") || return
+    percent=${status##* }
+    percent=${percent%\%}
+
+    if [ "$all" = 1 ] || [ "$percent" -le "$BAT_LOW" ]; then
+        color=$GREEN
+        [ "$percent" -le 50 ] && color=$YELLOW
+        [ "$percent" -le "$BAT_LOW" ] && color=$RED
+        [[ $status == 󰂄* ]] && color=$GREEN    # charging
+        paint "$color" "$status"
     fi
 }
 
 bluetooth() {
-    local n
-    n=$(timeout 1 bluetoothctl devices Connected 2>/dev/null | grep -c '^Device')
-    if [ "$n" -gt 0 ]; then paint "$BLUE" "󰂱 $n"
-    elif [ "$all" = 1 ]; then paint "$DIM" "󰂯"
+    local connected
+    connected=$(timeout 1 bluetoothctl devices Connected 2>/dev/null | grep -c '^Device')
+    if [ "$connected" -gt 0 ]; then
+        paint "$BLUE" "󰂱 $connected"
+    elif [ "$all" = 1 ]; then
+        paint "$DIM" "󰂯"
     fi
 }
 
 wifi() {
     local ssid
     if timeout 1 nmcli -t -f TYPE,STATE device 2>/dev/null | grep -qE '^(wifi|ethernet):connected$'; then
-        if [ "$all" = 1 ]; then
-            # --rescan no: listing otherwise waits for a fresh scan, which can block for many seconds
-            ssid=$(timeout 1 nmcli -t -f ACTIVE,SSID device wifi list --rescan no 2>/dev/null | sed -n 's/^yes://p' | head -1)
-            esc "$ssid"; ssid=$REPLY
-            paint "$GREEN" "${ssid:+󰖩 $ssid}"
-            [ -z "$ssid" ] && paint "$GREEN" "󰈀"
+        [ "$all" = 1 ] || return
+        # --rescan no: listing otherwise waits for a fresh scan, which can block for many seconds
+        ssid=$(timeout 1 nmcli -t -f ACTIVE,SSID device wifi list --rescan no 2>/dev/null | sed -n 's/^yes://p' | head -1)
+        esc "$ssid"; ssid=$REPLY
+        if [ -n "$ssid" ]; then
+            paint "$GREEN" "󰖩 $ssid"
+        else
+            paint "$GREEN" "󰈀"       # connected without wifi: a cable
         fi
     else
         paint "$RED" "󰖪"
     fi
 }
 
+# shown for SHOW_CHANGE seconds after the volume or mute state changes
 volume() {
-    local out pct icon
+    local out percent icon color current now
     out=$(timeout 1 wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null) || return
-    pct=$(echo "$out" | awk '{printf "%d", $2 * 100}')
-    col=$CYAN
-    if [[ $out == *MUTED* ]]; then icon=󰝟; col=$DIM
-    elif [ "$pct" -lt 34 ]; then icon=󰕿
-    elif [ "$pct" -lt 67 ]; then icon=󰖀
-    else icon=󰕾
+    percent=$(echo "$out" | awk '{printf "%d", $2 * 100}')
+
+    color=$CYAN
+    if [[ $out == *MUTED* ]]; then
+        icon=󰝟
+        color=$DIM
+    elif [ "$percent" -lt 34 ]; then
+        icon=󰕿
+    elif [ "$percent" -lt 67 ]; then
+        icon=󰖀
+    else
+        icon=󰕾
     fi
-    local cur="$icon $pct%" now
+
+    current="$icon $percent%"
     now=$(date +%s)
-    if [ "$cur" != "$last_vol" ]; then
+    if [ "$current" != "$last_vol" ]; then
         [ -n "$last_vol" ] && vol_until=$((now + SHOW_CHANGE))
-        last_vol=$cur
+        last_vol=$current
     fi
-    { [ "$all" = 1 ] || [ "$now" -lt "$vol_until" ]; } && paint "$col" "$cur"
+
+    if [ "$all" = 1 ] || [ "$now" -lt "$vol_until" ]; then
+        paint "$color" "$current"
+    fi
+}
+
+# --- drawing -----------------------------------------------------------------------------------
+
+# sets $all to 1 while "show everything" is on (`statusbar-refresh all` writes when it ends)
+read_show_all() {
+    all=0
+    [ -f "$showall_file" ] || return
+    if [ "$(date +%s)" -lt "$(cat "$showall_file")" ]; then
+        all=1
+    else
+        rm -f "$showall_file"
+    fi
+}
+
+# prints the whole status line: the modules that have something to show, then the clock
+draw() {
+    local parts=() module line part
+    for module in rec pres cpu mem disk net brightness bluetooth wifi volume dnd profile battery media; do
+        res=""
+        $module
+        [ -n "$res" ] && parts+=("$res")
+    done
+
+    printf -v res '<span foreground="%s">󰃭</span> %s  <span foreground="%s">󰅐</span> %s' \
+        "$DIM" "$(date '+%a %d %b')" "$DIM" "$(date '+%H:%M')"
+    parts+=("$res")
+
+    line=${parts[0]}
+    for part in "${parts[@]:1}"; do
+        line+="$GAP$part"
+    done
+    printf '%s\n' "$line"
+}
+
+# seconds until the next refresh: quick while something temporary is on screen, so it goes away on time
+refresh_delay() {
+    local now
+    now=$(date +%s)
+    if [ "$all" = 1 ] || [ "$now" -lt "$bright_until" ] || [ "$now" -lt "$vol_until" ]; then
+        echo 1
+    else
+        echo "$IDLE"
+    fi
+}
+
+# sleep in 1 second steps: a signal ends the sleep early, and nothing can slip in between the check and the sleep
+wait_for_refresh() {
+    local delay=$1 step sleeper
+    for ((step = 0; step < delay && poke == 0; step++)); do
+        sleep 1 & sleeper=$!
+        wait "$sleeper"
+        kill "$sleeper" 2>/dev/null
+    done
 }
 
 while :; do
-    echo $$ > "$pidfile"   # self-heal: another instance's exit (e.g. a reload) may have removed it
+    echo $$ > "$pidfile"    # self-heal: another instance's exit (e.g. a reload) may have removed it
     poke=0
-    all=0
-    if [ -f "$showall_file" ]; then
-        if [ "$(date +%s)" -lt "$(cat "$showall_file")" ]; then all=1; else rm -f "$showall_file"; fi
-    fi
-    parts=()
-    for m in rec pres cpu mem disk net brightness bluetooth wifi volume dnd profile battery media; do
-        res=""
-        $m
-        [ -n "$res" ] && parts+=("$res")
-    done
-    printf -v res '<span foreground="%s">󰃭</span> %s  <span foreground="%s">󰅐</span> %s' "$DIM" "$(date '+%a %d %b')" "$DIM" "$(date '+%H:%M')"
-    parts+=("$res")
-    line=${parts[0]}
-    # the gap is its own span: plain spaces between two icons are drawn from the symbols font, where a space is a dot
-    gap='<span font_family="JetBrains Mono">  </span>'
-    for p in "${parts[@]:1}"; do line+="$gap$p"; done
-    printf '%s\n' "$line"
+    read_show_all
+    draw
 
     # a signal arrived while we were drawing: draw again right away
     [ "$poke" = 1 ] && continue
 
-    # poll quickly while something temporary is on screen so it disappears on time
-    delay=$IDLE
-    now=$(date +%s)
-    { [ "$all" = 1 ] || [ "$now" -lt "$bright_until" ] || [ "$now" -lt "$vol_until" ]; } && delay=1
-    # sleep in 1s steps; a signal ends the sleep early and nothing can slip between check and sleep
-    for ((t = 0; t < delay && poke == 0; t++)); do
-        sleep 1 & sl=$!
-        wait "$sl"
-        kill "$sl" 2>/dev/null
-    done
+    wait_for_refresh "$(refresh_delay)"
 done
