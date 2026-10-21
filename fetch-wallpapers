@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Download the curated wallpapers listed in wallpapers.txt into ~/Pictures/Wallpapers.
-# Usage: fetch-wallpapers
-# Sources: wallhaven ids and Wikimedia Commons files.
-# Images are scaled down to at most 3840 px wide; existing files are skipped.
+# fetch-wallpapers: download the curated wallpapers listed in wallpapers.txt into ~/Pictures/Wallpapers.
+# Sources: wallhaven ids and Wikimedia Commons files ("commons:File:Name.jpg").
+# Images are scaled down to at most 3840 px wide; files that already exist are skipped.
 set -u
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 DIR="$HOME/Pictures/Wallpapers"
@@ -10,31 +9,50 @@ LIST="$here/wallpapers.txt"
 UA="Mozilla/5.0 fetch-wallpapers"
 mkdir -p "$DIR"
 
-fetch() { # out-file source-url
+# fetch OUT_FILE URL: download, check that it is an image, scale it down, save it as OUT_FILE
+fetch() {
+    local out=$1 url=$2 tmp
     tmp=$(mktemp "$DIR/.part-XXXXXX")
-    if curl -fsSL -m 180 -A "$UA" -o "$tmp" "$2" && file -b --mime-type "$tmp" | grep -q '^image/'; then
-        magick "$tmp" -resize '3840x>' -quality 90 "$1" && echo "  + $(basename "$1")"
+    if curl -fsSL -m 180 -A "$UA" -o "$tmp" "$url" && file -b --mime-type "$tmp" | grep -q '^image/'; then
+        magick "$tmp" -resize '3840x>' -quality 90 "$out" && echo "  + $(basename "$out")"
     else
-        echo "  ! $(basename "$1"): download failed"
+        echo "  ! $(basename "$out"): download failed"
     fi
     rm -f "$tmp"
-    sleep 3
+    sleep 3    # be gentle with the servers
+}
+
+# slug TEXT: lower case, every run of other characters becomes one dash
+slug() {
+    printf '%s' "$1" | tr -c 'A-Za-z0-9\n' '-' | tr -s '-' | tr 'A-Z' 'a-z' | sed 's/^-//; s/-$//'
+}
+
+# commons_url TITLE: the download address of a Wikimedia Commons file
+commons_url() {
+    local title=$1
+    echo "https://commons.wikimedia.org/wiki/Special:FilePath/$(printf '%s' "$title" | tr ' ' '_' | jq -sRr @uri)"
+}
+
+# wallhaven_url ID: the real file path (and extension) the API gives for an id
+wallhaven_url() {
+    curl -fsS -m 20 -A "$UA" "https://wallhaven.cc/api/v1/w/$1" | jq -r '.data.path'
 }
 
 grep -v '^#' "$LIST" | while IFS= read -r line; do
     case $line in
-    commons:*)
-        title=${line#commons:}; title=${title#File:}
-        out="$DIR/$(printf '%s' "${title%.*}" | tr -c 'A-Za-z0-9\n' '-' | tr -s '-' | tr 'A-Z' 'a-z' | sed 's/^-//; s/-$//').jpg"
-        [ -s "$out" ] || fetch "$out" "https://commons.wikimedia.org/wiki/Special:FilePath/$(printf '%s' "$title" | tr ' ' '_' | jq -sRr @uri)"
-        ;;
-    *)
-        id=${line%% *}; out="$DIR/$id.jpg"
-        [ -s "$out" ] && continue
-        # the API gives the real file path (and extension) for an id
-        url=$(curl -fsS -m 20 -A "$UA" "https://wallhaven.cc/api/v1/w/$id" | jq -r '.data.path') || { echo "  ! $id: lookup failed"; continue; }
-        fetch "$out" "$url"
-        ;;
+        commons:*)
+            title=${line#commons:}
+            title=${title#File:}
+            out="$DIR/$(slug "${title%.*}").jpg"
+            [ -s "$out" ] || fetch "$out" "$(commons_url "$title")"
+            ;;
+        *)
+            id=${line%% *}
+            out="$DIR/$id.jpg"
+            [ -s "$out" ] && continue
+            url=$(wallhaven_url "$id") || { echo "  ! $id: lookup failed"; continue; }
+            fetch "$out" "$url"
+            ;;
     esac
 done
 echo "done: $(find "$DIR" -maxdepth 1 -type f | wc -l) wallpapers in $DIR"
