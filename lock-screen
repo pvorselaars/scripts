@@ -1,21 +1,33 @@
 #!/bin/sh
-# Lock the screen with a blurred, darkened snapshot of what was on it. Does nothing if it is already
-# locked, so triggers can overlap safely (idle timeout, sleep, loginctl lock-session, $mod+Escape).
+# lock-screen: lock the screen with a blurred, darkened snapshot of what was on it.
+# Does nothing if it is already locked, so triggers can overlap safely (idle timeout, sleep,
+# loginctl lock-session, $mod+Escape).
 # Colours: One Dark Darker, same as the sway config. The ring only appears while typing.
 pgrep -x swaylock >/dev/null && exit 0
 
 dir=${XDG_RUNTIME_DIR:-/tmp}/lock-screen
 mkdir -p "$dir"
+
+# snapshot OUTPUT: save a blurred, darkened picture of the output as $dir/OUTPUT.png (fails if it cannot)
+snapshot() {
+    image="$dir/$1.png"
+    # grab at a quarter of the size: blurring that is fast, and scaled back up it is smooth anyway
+    grim -s 0.25 -o "$1" "$image" 2>/dev/null &&
+        magick "$image" -virtual-pixel edge -blur 0x4 -modulate 55,80 \
+            -fill '#1f2329' -colorize 25% -resize 400% "$image" 2>/dev/null
+}
+
+# one "-i OUTPUT:FILE" per active output that could be captured
 images=""
 for out in $(swaymsg -t get_outputs -r | jq -r '.[] | select(.active) | .name'); do
-    # grab at a quarter of the size: blurring that is fast, and scaled back up it is smooth anyway
-    if grim -s 0.25 -o "$out" "$dir/$out.png" 2>/dev/null &&
-       magick "$dir/$out.png" -virtual-pixel edge -blur 0x4 -modulate 55,80 -fill '#1f2329' -colorize 25% -resize 400% "$dir/$out.png" 2>/dev/null; then
+    if snapshot "$out"; then
         images="$images -i $out:$dir/$out.png"
     fi
 done
 
-# shellcheck disable=SC2086
+# The indicator is a ring only: the inside and the lines are transparent (00000000).
+# ring = idle/typing, -clear = cleared, -caps-lock, -ver = verifying, -wrong = wrong password.
+# shellcheck disable=SC2086   # $images holds several words on purpose
 exec swaylock -f -c 1f2329 $images --scaling fill \
     --font "JetBrains Mono" --font-size 22 --indicator-radius 70 --indicator-thickness 4 \
     --inside-color 00000000 --inside-clear-color 00000000 --inside-caps-lock-color 00000000 \
