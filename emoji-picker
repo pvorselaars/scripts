@@ -1,38 +1,71 @@
 #!/bin/bash
-# Pick an emoji or symbol in fuzzel and copy it to the clipboard.
-# Uses the full emoji list if the unicode-emoji package is installed, otherwise a built-in subset by Unicode name.
+# emoji-picker: pick an emoji or symbol in fuzzel and copy it to the clipboard.
+# The list is the full emoji list if the unicode-emoji package is installed (emoji-test.txt), followed by
+# the symbols of a few Unicode blocks (arrows, math, currency, Greek, ...), named after UnicodeData.txt.
 # `emoji-picker --print` lists the entries instead.
+EMOJI_TEST=${EMOJI_TEST:-/usr/share/unicode/emoji/emoji-test.txt}
+UNICODE_DATA=${UNICODE_DATA:-/usr/share/unicode/ucd/UnicodeData.txt}
+
+# list: one "character  name" line per entry, each character once
 list() {
-python3 -I - <<'PY'
-import os, unicodedata
-seen = set()
-def add(ch, name):
-    if ch not in seen:
-        seen.add(ch); print(f"{ch}  {name}")
+    # gawk in a UTF-8 locale turns a code point into its character with %c
+    LC_ALL=C.UTF-8 gawk -v emoji_test="$EMOJI_TEST" -v unicode_data="$UNICODE_DATA" '
+        function add(char, name) {
+            if (!(char in seen)) {
+                seen[char] = 1
+                print char "  " name
+            }
+        }
 
-test = "/usr/share/unicode/emoji/emoji-test.txt"
-if os.path.exists(test):
-    for line in open(test, encoding="utf-8"):
-        if line.startswith("#") or "; fully-qualified" not in line:
-            continue
-        rest = line.split("#", 1)[1].split(None, 2)      # char, Ex.y, name
-        if len(rest) == 3:
-            add(rest[0], rest[2].strip())
+        # the block "first-last" as hex code points, and single characters
+        function add_range(first, last,   code) {
+            for (code = strtonum("0x" first); code <= strtonum("0x" last); code++)
+                if (code in names) add(sprintf("%c", code), tolower(names[code]))
+        }
+        function add_one(code) {
+            if (code in names) add(sprintf("%c", code), tolower(names[code]))
+        }
 
-ranges = [(0x1F300, 0x1FAFF), (0x2600, 0x27BF), (0x2190, 0x21FF), (0x2200, 0x22FF), (0x2300, 0x23FF),
-          (0x25A0, 0x25FF), (0x20A0, 0x20CF), (0x2100, 0x214F), (0x00A1, 0x00BF), (0x0391, 0x03C9), (0x2B00, 0x2BFF)]
-for lo, hi in ranges:
-    for cp in range(lo, hi + 1):
-        try:
-            add(chr(cp), unicodedata.name(chr(cp)).lower())
-        except ValueError:
-            pass
-for cp in (0xD7, 0xF7):
-    add(chr(cp), unicodedata.name(chr(cp)).lower())
-PY
+        BEGIN {
+            # 1. the emoji list: "<code points> ; fully-qualified # <emoji> E1.0 <name>"
+            while ((getline line < emoji_test) > 0) {
+                if (line ~ /^#/ || line !~ /; fully-qualified/) continue
+                sub(/^[^#]*#[ \t]*/, "", line)             # what is after the "#": emoji, version, name
+                if (match(line, /^[^ \t]+[ \t]+[^ \t]+[ \t]+/)) {
+                    char = line; sub(/[ \t].*$/, "", char)
+                    name = substr(line, RLENGTH + 1); sub(/[ \t]+$/, "", name)
+                    add(char, name)
+                }
+            }
+
+            # 2. the names of all characters; control characters and block markers have none
+            FS = ";"
+            while ((getline line < unicode_data) > 0) {
+                split(line, field, ";")
+                if (field[2] !~ /^</) names[strtonum("0x" field[1])] = field[2]
+            }
+
+            add_range("1F300", "1FAFF")     # pictographs, emoticons, transport, supplemental symbols
+            add_range("2600", "27BF")       # miscellaneous symbols, dingbats
+            add_range("2190", "21FF")       # arrows
+            add_range("2200", "22FF")       # mathematical operators
+            add_range("2300", "23FF")       # miscellaneous technical
+            add_range("25A0", "25FF")       # geometric shapes
+            add_range("20A0", "20CF")       # currency symbols
+            add_range("2100", "214F")       # letterlike symbols
+            add_range("00A1", "00BF")       # Latin-1 punctuation and symbols
+            add_range("0391", "03C9")       # Greek letters
+            add_range("2B00", "2BFF")       # miscellaneous symbols and arrows
+            add_one(strtonum("0xD7"))       # multiplication sign
+            add_one(strtonum("0xF7"))       # division sign
+        }'
 }
 
-if [ "$1" = --print ]; then list; exit 0; fi
+if [ "$1" = --print ]; then
+    list
+    exit 0
+fi
+
 choice=$(list | fuzzel --dmenu --prompt 'emoji> ' --width 60 --lines 12) || exit 0
 char=${choice%%  *}
 printf '%s' "$char" | wl-copy
