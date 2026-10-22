@@ -54,10 +54,17 @@ connect_device() {
 # pairing also marks the device as trusted, so it reconnects by itself later
 pair_device() {
     local mac=$1
+    # With pairable mode off, bluez pairs without a bond: the device connects once, but the laptop
+    # keeps no link key, so it never reconnects by itself.
+    bluetoothctl pairable on >/dev/null 2>&1
     if bluetoothctl pair "$mac" >/dev/null 2>&1 &&
        bluetoothctl trust "$mac" >/dev/null 2>&1 &&
        bluetoothctl connect "$mac" >/dev/null 2>&1; then
-        say "Paired and connected"
+        if bluetoothctl info "$mac" | grep -q 'Bonded: yes'; then
+            say "Paired and connected"
+        else
+            say -u critical "Connected, but not bonded" "It will not reconnect by itself. Try pairing again."
+        fi
     else
         say -u critical "Could not pair"
     fi
