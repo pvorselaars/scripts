@@ -1,25 +1,39 @@
 #!/bin/bash
 # presentation-mode: toggle. On: do-not-disturb, no blue-light filter, no idle lock or screen-off.
-# Off: restores them (do-not-disturb only if it was off before). The bar shows PRES while it is on.
-state="${XDG_RUNTIME_DIR:-/tmp}/presentation.mode"   # holds 1 when do-not-disturb was already on before we started
+# Off: restores them (do-not-disturb only if it was off before). The bar shows an icon while it is on.
 refresh="$HOME/.local/bin/statusbar-refresh"
 sway_config="$HOME/.config/sway/config"
 
+# The state file exists while the mode is on. It holds 1 when do-not-disturb was already on before
+# we started, so turning the mode off leaves it on.
+state="${XDG_RUNTIME_DIR:-/tmp}/presentation.mode"
+
 dnd_on() { makoctl mode 2>/dev/null | grep -q do-not-disturb; }
 
-if [ -f "$state" ]; then
-    was_dnd=$(cat "$state"); rm -f "$state"
+turn_off() {
+    local was_dnd args
+    was_dnd=$(cat "$state")
+    rm -f "$state"
     [ "$was_dnd" = 1 ] || makoctl mode -r do-not-disturb >/dev/null
-    # same arguments as the autostart line in the sway config
+
+    # the night light comes back with the same arguments as the autostart line in the sway config
     args=$(sed -n 's/^exec wlsunset //p' "$sway_config")
     pgrep -x wlsunset >/dev/null || setsid -f wlsunset $args >/dev/null 2>&1
     systemctl --user start swayidle
     notify-send -a presentation-mode -t 2000 "Presentation mode off"
-else
+}
+
+turn_on() {
     notify-send -a presentation-mode -t 2000 "Presentation mode on" "notifications, night light and screen lock are off"
     if dnd_on; then echo 1 > "$state"; else echo 0 > "$state"; fi
     makoctl mode -a do-not-disturb >/dev/null
     pkill -x wlsunset
     systemctl --user stop swayidle
+}
+
+if [ -f "$state" ]; then
+    turn_off
+else
+    turn_on
 fi
 "$refresh"

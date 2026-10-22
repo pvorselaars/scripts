@@ -1,23 +1,42 @@
 #!/usr/bin/env bash
-# Toggle "show desktop": send every window on the current workspace to the scratchpad, or bring them back.
-# Sway has no minimize, so the scratchpad is used; the ids are remembered per workspace in a state file.
+# minimize-all: toggle "show desktop": send every window on the current workspace to the scratchpad,
+# or bring them back. Sway has no minimize, so the scratchpad is used; the window ids are remembered
+# per workspace in a state file.
 state="${XDG_RUNTIME_DIR:-/tmp}/minimize-all"
 mkdir -p "$state"
-ws=$(swaymsg -t get_workspaces -r | jq -r '.[] | select(.focused) | .name')
-file="$state/${ws//\//_}"
+workspace=$(swaymsg -t get_workspaces -r | jq -r '.[] | select(.focused) | .name')
+file="$state/${workspace//\//_}"
 
-if [ -s "$file" ]; then
-    # restore: the saved windows that still exist come back onto this workspace, tiled again
+# window_ids WORKSPACE: the ids of the windows on a workspace, tiled and floating.
+# The dropdown terminal is left alone: it lives in the scratchpad already.
+window_ids() {
+    swaymsg -t get_tree -r | jq -r --arg ws "$1" '
+        .nodes[].nodes[] | select(.type == "workspace" and .name == $ws)
+        | [recurse(.nodes[]?, .floating_nodes[]?)
+           | select(.pid? and .app_id != "dropdown" and (.nodes | length) == 0)]
+        | .[].id'
+}
+
+# the saved windows that still exist come back onto this workspace, tiled again
+restore() {
+    local id
     while read -r id; do
         swaymsg "[con_id=$id] scratchpad show, floating disable" > /dev/null
     done < "$file"
     rm -f "$file"
-else
-    swaymsg -t get_tree -r | jq -r --arg ws "$ws" '
-        .nodes[].nodes[] | select(.type == "workspace" and .name == $ws)
-        | [recurse(.nodes[]?, .floating_nodes[]?) | select(.pid? and .app_id != "dropdown" and (.nodes | length) == 0)] | .[].id' > "$file"
+}
+
+minimize() {
+    local id
+    window_ids "$workspace" > "$file"
     while read -r id; do
         swaymsg "[con_id=$id] move scratchpad" > /dev/null
     done < "$file"
-    [ -s "$file" ] || rm -f "$file"
+    [ -s "$file" ] || rm -f "$file"     # nothing was minimized: nothing to restore later
+}
+
+if [ -s "$file" ]; then
+    restore
+else
+    minimize
 fi
