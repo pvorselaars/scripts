@@ -1,9 +1,0 @@
-#!/bin/sh
-# background: swap the wallpaper for a random one every 30 minutes, with swaybg.
-# Old; `wallpaper-cycle` does the same through sway itself and is what the sway config runs.
-
-while true; do
-    wallpaper=$(ls ~/pictures/wallpapers/4K/* | shuf -n 1)
-    swaybg -i "$wallpaper" -m fill
-    sleep 30m
-done &

@@ -1,3 +1,0 @@
-#!/bin/sh
-# screenshotselcopy: copy a selected area to the clipboard as a PNG.
-grim -g "$(slurp)" - | wl-copy --type image/png

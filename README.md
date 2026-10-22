@@ -17,7 +17,6 @@ Small scripts for the sway desktop and for development. They are linked into `~/
 | `screen-record` | Start or stop a recording (`region` or `full`) |
 | `wallpaper-cycle` | Rotate the wallpaper; `SIGUSR1` skips to the next one |
 | `battery`, `battery-warn` | Battery text for the bar, and the low-battery notifications |
-| `background`, `screenshot`, `screenshotsel`, `screenshotselcopy` | Older helpers; they use `~/pictures/...` |
 
 ## Pickers (fuzzel)
 
