@@ -1,39 +1,62 @@
 #!/bin/bash
-# Pick a Firefox bookmark in fuzzel and open it. `bookmarks --print` lists them instead.
+# bookmarks: pick a Firefox bookmark in fuzzel and open it. `bookmarks --print` lists them instead.
 # Uses the most recently active profile; set FIREFOX_PROFILE to a profile directory to override.
-list() {
-python3 -I - "${FIREFOX_PROFILE:-}" <<'PY'
-import glob, os, shutil, sqlite3, sys, tempfile
-profile = sys.argv[1]
-if not profile:
-    dbs = glob.glob(os.path.expanduser("~/.config/mozilla/firefox/*/places.sqlite")) + \
-          glob.glob(os.path.expanduser("~/.mozilla/firefox/*/places.sqlite"))
-    if not dbs:
-        sys.exit(0)
-    newest = lambda d: max(os.path.getmtime(f) for f in (d, d + "-wal") if os.path.exists(f))
-    profile = os.path.dirname(max(dbs, key=newest))
-src = os.path.join(profile, "places.sqlite")
-tmp = tempfile.mkdtemp()
-try:
-    for ext in ("", "-wal"):                    # copy: the live database is locked by Firefox
-        if os.path.exists(src + ext):
-            shutil.copy(src + ext, os.path.join(tmp, "places.sqlite" + ext))
-    con = sqlite3.connect(os.path.join(tmp, "places.sqlite"))
-    rows = con.execute("""SELECT b.title, p.url FROM moz_bookmarks b JOIN moz_places p ON b.fk = p.id
-                          WHERE b.type = 1 AND p.url NOT LIKE 'place:%' ORDER BY b.title COLLATE NOCASE""").fetchall()
-finally:
-    shutil.rmtree(tmp, ignore_errors=True)
-seen = set()
-for title, url in rows:
-    if url in seen:
-        continue
-    seen.add(url)
-    title = (title or url).replace("\t", " ")
-    print(f"{title[:60]}\t{url}")
-PY
+# Needs the sqlite3 command line tool (sudo dnf install sqlite).
+
+# newest_profile: the profile folder whose places.sqlite (or its write-ahead log) changed last
+newest_profile() {
+    local db file stamp best_stamp=0 best=""
+    for db in ~/.config/mozilla/firefox/*/places.sqlite ~/.mozilla/firefox/*/places.sqlite; do
+        [ -e "$db" ] || continue
+        for file in "$db" "$db-wal"; do
+            [ -e "$file" ] || continue
+            stamp=$(stat -c %.9Y "$file")     # modification time, with nanoseconds
+            stamp=${stamp/./}
+            if [ "$stamp" -gt "$best_stamp" ]; then
+                best_stamp=$stamp
+                best=$(dirname "$db")
+            fi
+        done
+    done
+    echo "$best"
 }
 
-if [ "$1" = --print ]; then list | tr '\t' ' '; exit 0; fi
-choice=$(list | awk -F'\t' '{printf "%-62s %s\n", $1, $2}' | fuzzel --dmenu --prompt 'bookmark> ' --width 110 --lines 15) || exit 0
+# list: one "title<TAB>url" line per bookmark, sorted by title, every url once
+list() {
+    local profile=${FIREFOX_PROFILE:-$(newest_profile)} database copy
+    database="$profile/places.sqlite"
+    [ -n "$profile" ] && [ -f "$database" ] || return 0
+
+    # work on a copy: the live database is locked by Firefox
+    copy=$(mktemp -d)
+    cp "$database" "$copy/places.sqlite"
+    [ -e "$database-wal" ] && cp "$database-wal" "$copy/places.sqlite-wal"
+
+    # type 1 is a bookmark (not a folder or a separator); a bookmark without a title shows its url,
+    # and the title is cut to 60 characters with tabs and line breaks turned into spaces
+    sqlite3 -separator $'\t' "$copy/places.sqlite" "
+        SELECT substr(replace(replace(replace(coalesce(nullif(b.title, ''), p.url),
+                                              char(9), ' '), char(10), ' '), char(13), ' '), 1, 60),
+               p.url
+        FROM moz_bookmarks b JOIN moz_places p ON b.fk = p.id
+        WHERE b.type = 1 AND p.url NOT LIKE 'place:%'
+        ORDER BY b.title COLLATE NOCASE" | awk -F'\t' '!seen[$2]++'
+
+    rm -rf "$copy"
+}
+
+command -v sqlite3 >/dev/null || {
+    echo "bookmarks: sqlite3 is not installed (sudo dnf install sqlite)" >&2
+    notify-send -u critical -a bookmarks "sqlite3 is not installed"
+    exit 1
+}
+
+if [ "$1" = --print ]; then
+    list | tr '\t' ' '
+    exit 0
+fi
+
+choice=$(list | awk -F'\t' '{printf "%-62s %s\n", $1, $2}' |
+    fuzzel --dmenu --prompt 'bookmark> ' --width 110 --lines 15) || exit 0
 url=${choice##* }
 exec firefox "$url" >/dev/null 2>&1
