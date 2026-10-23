@@ -1,0 +1,304 @@
+#!/bin/bash
+# gif-picker: search Giphy and pick a GIF by its picture in rofi. Enter puts the GIF on the clipboard as a picture by its
+# address (HTML, so Teams in Firefox shows it moving when you paste); Shift+Enter puts the link to its Giphy page there.
+#
+#   gif-picker                      ask what to search for (nothing: what is trending), then pick
+#   gif-picker WORDS...             search for WORDS
+#   gif-picker --print [WORDS...]   list the titles of the results, one per line, without the menu
+#
+# In the grid: h j k l (or the arrows) move the highlight, Enter or Shift+Enter picks, Escape or q closes.
+# The grid shows still pictures (rofi cannot play a GIF). A small floating mpv window next to the menu plays the GIF
+# that is highlighted. It needs this rule in the sway config, so that it floats and does not take the focus:
+#   for_window [app_id="gif-preview"] floating enable, sticky enable, border none
+#   no_focus [app_id="gif-preview"]
+# (the script puts the window right of the menu, as high as the menu, itself, once it has a size)
+# Without the rule (or without mpv and ncat) there is no preview. GIF_PREVIEW=0 turns it off, GIF_PREVIEW=force skips
+# the check for the rule.
+#
+# It needs a Giphy API key (free: developers.giphy.com, "Create an App", then the API). The key is looked up in
+# this order:
+#   1. the environment:  GIPHY_API_KEY
+#   2. the keyring:      secret-tool store --label="Giphy API key" service gif-picker name api_key
+#   3. the config file:  ~/.config/gif-picker/config, a line GIPHY_API_KEY=...
+# The same file can have RATING=pg-13 (g, pg, pg-13 or r) and LIMIT=24 (how many results).
+# The pictures are kept in $XDG_RUNTIME_DIR/gif-picker. Overrides, mostly for testing: GIF_CONFIG, GIF_CACHE, GIPHY_API.
+
+CONFIG=${GIF_CONFIG:-$HOME/.config/gif-picker/config}
+CACHE=${GIF_CACHE:-${XDG_RUNTIME_DIR:-/tmp}/gif-picker}
+GIPHY=${GIPHY_API:-https://api.giphy.com}
+THEME=$HOME/.config/rofi/onedark.rasi
+SELF=$(readlink -f "$0")
+# The menu is this big, in percent of the screen, so that the preview can be made to match it (see place_preview).
+# Four pictures wide, three high, the title under each.
+MENU_WIDTH=58
+MENU_HEIGHT=50
+GRID="window {width: $MENU_WIDTH%; height: $MENU_HEIGHT%;} listview {columns: 4; lines: 3; flow: horizontal; spacing: 8px;}
+      element {orientation: vertical; padding: 6px;} element-icon {size: 8em;} element-text {horizontal-align: 0.5;}"
+# the keys of the grid: h j k l and the arrows move the highlight, q closes. The letters no longer type into the
+# filter, which does not matter: the search is done in the box before. Control+h/j/k/l work too (config.rasi of rofi).
+KEYS=(-kb-row-left "Left,h,Control+h" -kb-row-right "Right,l,Control+l" -kb-row-up "Up,k,Control+k,Control+p"
+      -kb-row-down "Down,j,Control+j,Control+n" -kb-cancel "Escape,q,Control+g,Control+bracketleft")
+
+die() { echo "gif-picker: $*" >&2; exit 1; }
+
+# the comment block at the top of this file, without the "# "
+usage() { sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//'; }
+
+# --- settings ---------------------------------------------------------------------------------------
+
+# config_value NAME: a value from the config file (the file is read, not run)
+config_value() {
+    if [ -r "$CONFIG" ]; then
+        sed -n "s/^$1=//p" "$CONFIG" | head -n 1
+    fi
+}
+
+load_config() {
+    RATING=$(config_value RATING)
+    RATING=${RATING:-pg-13}
+    LIMIT=$(config_value LIMIT)
+    LIMIT=${LIMIT:-24}
+    if [ -z "${GIPHY_API_KEY:-}" ]; then
+        GIPHY_API_KEY=$(secret-tool lookup service gif-picker name api_key 2>/dev/null)
+    fi
+    if [ -z "$GIPHY_API_KEY" ]; then
+        GIPHY_API_KEY=$(config_value GIPHY_API_KEY)
+    fi
+    [ -n "$GIPHY_API_KEY" ] || die "no Giphy API key (see the top of this script for where to put it)"
+}
+
+# --- Giphy ------------------------------------------------------------------------------------------
+
+# results QUERY: one JSON object per GIF that matches QUERY (what is trending without one):
+#   {id, title, thumb, anim, file, page}   thumb: a small still picture, anim: the same GIF, playing, file: a GIF of
+#   at most 2 MB to paste, page: its page on giphy.com
+#   (the addresses without the tracking parameters)
+results() {
+    local endpoint=trending json args=(--data-urlencode "api_key=$GIPHY_API_KEY" --data-urlencode "limit=$LIMIT"
+                                       --data-urlencode "rating=$RATING")
+    if [ -n "$1" ]; then
+        endpoint=search
+        args+=(--data-urlencode "q=$1")
+    fi
+    json=$(curl -fs -G "$GIPHY/v1/gifs/$endpoint" "${args[@]}") \
+        || die "Giphy did not answer: is the API key right, and is it not over its limit?"
+    jq -c '(.data // [])[] | {id, title: (.title | if . == "" then "gif" else . end),
+                              thumb: .images.fixed_width_still.url,
+                              anim: (.images.fixed_width.url | sub("\\?.*$"; "")),
+                              file: ((.images.downsized.url // .images.original.url) | sub("\\?.*$"; "")), page: .url}' <<< "$json"
+}
+
+# fetch_thumbs RESULTS: download the pictures that are not here yet, eight at a time
+fetch_thumbs() {
+    local args=() id thumb
+    mkdir -p "$CACHE/thumbs"
+    while IFS=$'\t' read -r id thumb; do
+        if [ ! -s "$CACHE/thumbs/$id.gif" ]; then
+            args+=(-o "$CACHE/thumbs/$id.gif" "$thumb")
+        fi
+    done < <(jq -r '[.id, .thumb] | @tsv' <<< "$1")
+    if [ "${#args[@]}" -gt 0 ]; then
+        curl -sS --fail --parallel --parallel-max 8 "${args[@]}" 2>/dev/null || true
+    fi
+}
+
+# titles RESULTS: "id TAB title TAB anim" lines. The title is what rofi shows and what the preview gets back from rofi
+# (as words), so it has plain characters only, and a number when an earlier GIF has the same title.
+titles() {
+    jq -r '[.id, .title, .anim] | @tsv' <<< "$1" | gawk -F'\t' -v OFS='\t' '
+        {
+            title = $2
+            gsub(/[^[:alnum:] _.,:!?&()+@-]/, "", title)
+            gsub(/ +/, " ", title)
+            sub(/^ /, "", title); sub(/ $/, "", title)
+            if (title == "") title = "gif"
+            seen[title]++
+            if (seen[title] > 1) title = title " (" seen[title] ")"
+            print $1, title, $3
+        }'
+}
+
+# --- the preview ------------------------------------------------------------------------------------
+
+# preview_wanted: whether the preview can be shown (see the top of this script)
+preview_wanted() {
+    case ${GIF_PREVIEW:-auto} in
+        0)     return 1 ;;
+        force) return 0 ;;
+    esac
+    if ! command -v mpv >/dev/null || ! command -v ncat >/dev/null; then
+        return 1
+    fi
+    swaymsg -t get_config 2>/dev/null | jq -r '.config // empty' | grep -q 'app_id="gif-preview"'
+}
+
+# fetch_anim ID URL: the playing GIF, kept in the cache; prints its file (nothing when it could not be fetched)
+fetch_anim() {
+    local file="$CACHE/anim/$1.gif"
+    mkdir -p "$CACHE/anim"
+    if [ ! -s "$file" ]; then
+        curl -fsS --max-time 10 -o "$file" "$2" 2>/dev/null || rm -f "$file"
+    fi
+    if [ -s "$file" ]; then
+        echo "$file"
+    fi
+}
+
+# start_preview TITLES: a floating mpv window that stays open and plays what it is told to (over its socket)
+start_preview() {
+    local first_id first_url file args=() id url
+    IFS=$'\t' read -r first_id _ first_url < <(head -n 1 <<< "$1")
+    file=$(fetch_anim "$first_id" "$first_url")
+    if [ -z "$file" ]; then
+        return 1
+    fi
+    # the others come in while you look at the first
+    while IFS=$'\t' read -r id _ url; do
+        if [ ! -s "$CACHE/anim/$id.gif" ]; then
+            args+=(-o "$CACHE/anim/$id.gif" "$url")
+        fi
+    done < <(tail -n +2 <<< "$1")
+    if [ "${#args[@]}" -gt 0 ]; then
+        (curl -sS --fail --parallel --parallel-max 6 "${args[@]}" >/dev/null 2>&1 || true) &
+    fi
+    rm -f "$CACHE/preview.sock"
+    # the window keeps its size when the GIF changes (the pictures are fitted into it)
+    # the colour around the picture is that of the menu; GIF_MPV_OPTS adds options (a video output without a GPU, in tests)
+    # shellcheck disable=SC2086
+    mpv --no-config --idle=yes --force-window=yes --keep-open=yes --loop-file=inf --no-audio --no-osc --osd-level=0 \
+        --no-input-default-bindings --no-input-cursor --really-quiet --title=gif-preview --wayland-app-id=gif-preview \
+        --auto-window-resize=no --no-keepaspect-window --background=color --background-color='#1f2329' ${GIF_MPV_OPTS:-} \
+        --input-ipc-server="$CACHE/preview.sock" "$file" >/dev/null 2>&1 &
+    PREVIEW_PID=$!
+    place_preview &
+}
+
+# place_preview: wait for the preview window, then put it on the right of the screen, at 320 by 320 (sway puts a new
+# floating window in the middle, and a rule in the config cannot move it before it has a size)
+place_preview() {
+    local _ width height x y px py pw ph gap=12
+    for _ in $(seq 30); do
+        if swaymsg -t get_tree 2>/dev/null | jq -e '[.. | objects | select(.app_id? == "gif-preview")] | length > 0' >/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+    # the menu is in the middle of the screen; the preview is as high as the menu, right of it, and as wide as the
+    # space that is left (at least 240)
+    read -r width height x y < <(swaymsg -t get_outputs | jq -r '(first(.[] | select(.focused)) // .[0]) | "\(.rect.width) \(.rect.height) \(.rect.x) \(.rect.y)"')
+    ph=$((height * MENU_HEIGHT / 100))
+    px=$((x + (width + width * MENU_WIDTH / 100) / 2 + gap))
+    py=$((y + (height - ph) / 2))
+    pw=$((x + width - px - gap))
+    if [ "$pw" -lt 240 ]; then
+        pw=240
+    fi
+    swaymsg "[app_id=\"gif-preview\"] floating enable, sticky enable, border none, resize set $pw px $ph px, move absolute position $px px $py px" \
+        >/dev/null 2>&1
+}
+
+stop_preview() {
+    if [ -n "${PREVIEW_PID:-}" ]; then
+        kill "$PREVIEW_PID" 2>/dev/null
+    fi
+    rm -f "$CACHE/preview.sock"
+}
+
+# cmd_preview WORDS...: what rofi runs when the highlighted row changes: show the GIF with that title (the words)
+cmd_preview() {
+    local title id url file
+    title=$(tr -s ' ' <<< "$*")
+    IFS=$'\t' read -r id _ url < <(gawk -F'\t' -v t="$title" '$2 == t {print; exit}' "$CACHE/titles.tsv")
+    if [ -z "$id" ]; then
+        return 0
+    fi
+    file=$(fetch_anim "$id" "$url")
+    if [ -n "$file" ]; then
+        printf '{"command": ["loadfile", "%s", "replace"]}\n' "$file" | ncat -U --send-only "$CACHE/preview.sock" 2>/dev/null || true
+    fi
+}
+
+# --- the menus --------------------------------------------------------------------------------------
+
+# ask: what to search for (an empty list, so only what you type counts)
+ask() {
+    rofi -dmenu -p 'gif search>' -theme "$THEME" -theme-str 'listview {lines: 0;} window {width: 50ch;}' < /dev/null
+}
+
+# entries TITLES: the rows for rofi: the title and, after a NUL, its picture
+entries() {
+    local id title
+    while IFS=$'\t' read -r id title _; do
+        printf '%s\0icon\x1f%s\n' "$title" "$CACHE/thumbs/$id.gif"
+    done <<< "$1"
+}
+
+# menu [ROFI OPTION...]: choose one row of stdin by its picture; prints its number. Enter picks it, Shift+Enter picks
+# it with status 10 (rofi's first custom key; its own use of Shift+Enter is moved away).
+menu() {
+    rofi -dmenu -i -no-custom -show-icons -format i -p 'gif>' -theme "$THEME" -theme-str "$GRID" \
+        -kb-accept-alt "Control+Alt+Return" -kb-custom-1 "Shift+Return" "${KEYS[@]}" "$@"
+}
+
+# copy_gif URL: put the GIF on the clipboard as a picture by its address (an HTML <img> tag). Teams in Firefox shows
+# that as the moving GIF when you paste, which a plain link or an image/gif clipboard does not (tried with both).
+copy_gif() {
+    printf '<img src="%s">' "$1" | wl-copy --type text/html
+    notify-send -a gif -t 1500 "Copied the GIF" "paste it like a picture (Shift+Enter copies the link)"
+}
+
+# copy_page URL: put the link to the Giphy page of the GIF on the clipboard (chat apps show a preview of it)
+copy_page() {
+    printf '%s' "$1" | wl-copy
+    notify-send -a gif -t 1500 "Copied the GIF link" "$1"
+}
+
+# --- main -------------------------------------------------------------------------------------------
+
+case ${1:-} in
+    -h|--help|help) usage; exit 0 ;;
+    --preview)      shift; cmd_preview "$@"; exit 0 ;;
+esac
+print=0
+if [ "${1:-}" = --print ]; then
+    print=1
+    shift
+fi
+
+load_config
+query="$*"
+if [ -z "$query" ] && [ "$print" = 0 ]; then
+    query=$(ask) || exit 0
+fi
+list=$(results "$query") || exit 1
+if [ "$print" = 1 ]; then
+    jq -r .title <<< "$list"
+    exit 0
+fi
+if [ -z "$list" ]; then
+    notify-send -a gif -t 2500 "No GIFs found" "for: $query"
+    exit 0
+fi
+
+fetch_thumbs "$list"
+rows=$(titles "$list")
+mkdir -p "$CACHE"
+echo "$rows" > "$CACHE/titles.tsv"
+
+hook=()
+if preview_wanted && start_preview "$rows"; then
+    trap stop_preview EXIT
+    hook=(-on-selection-changed "'$SELF' --preview {entry}")
+fi
+choice=$(entries "$rows" | menu "${hook[@]}")
+status=$?
+case $status in
+    0|10) ;;
+    *)    exit 0 ;;
+esac
+picked=$(sed -n "$((choice + 1))p" <<< "$list")
+if [ "$status" = 10 ]; then
+    copy_page "$(jq -r .page <<< "$picked")"
+else
+    copy_gif "$(jq -r .file <<< "$picked")"
+fi
