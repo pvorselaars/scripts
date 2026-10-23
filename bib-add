@@ -60,7 +60,8 @@ search_edition() {
         pick=$(fzf --delimiter '\t' --with-nth 2 --prompt 'book> ' <<< "$list") || return $PICK_CANCELLED
     else
         cut -f2 <<< "$list" | nl -w2 -s'. ' >&2
-        read -r -p "Number: " n
+        read -r -p "Number [1]: " n
+        n=${n:-1}                                          # Enter takes the first result
         [[ $n =~ ^[0-9]+$ ]] || return $PICK_INVALID      # sed would read anything else as a command
         pick=$(sed -n "${n}p" <<< "$list")
         [ -n "$pick" ] || return $PICK_INVALID
