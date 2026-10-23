@@ -1,0 +1,249 @@
+#!/bin/bash
+# bug-report: record a part of the screen as a GIF, or take a picture of it, and make a Dev Bug of it under the work item it
+# is about. The Dev Bug is not assigned to anyone. Its description says what you were looking at: the branch and commit
+# of your clone (and whether it has uncommitted changes), the window you were working in, the screen and the area.
+#
+#   bug-report           the first time: choose the work item, then the area of the screen, and the recording starts.
+#                        The second time: it stops, you type what is wrong (that is the title of the Dev Bug), see what
+#                        will be sent, say yes, and the Dev Bug is made with the GIF attached.
+#   bug-report --shot    the same with a picture of the area instead of a recording, in one go
+#   bug-report --cancel  stop and throw the recording away
+#
+# Needs wf-recorder, slurp, grim, ffmpeg and ado. A recording that is forgotten stops by itself after MAX_SECONDS (120).
+# The GIF (or picture) is kept in ~/Videos/recordings. A GIF is made at most 15 MB; when it cannot be that small (a long or
+# busy recording) the video itself is attached instead, as a link. The bar shows REC while wf-recorder runs.
+# The state is in $XDG_RUNTIME_DIR/bug-report. Overrides, mostly for testing: BUG_REPORT_REGION ("x,y wxh" instead of
+# choosing the area with slurp), BUG_REPORT_DIR (where the files go), BUG_REPORT_LIMIT (the biggest GIF, in bytes).
+
+STATE=${XDG_RUNTIME_DIR:-/tmp}/bug-report
+DIR=${BUG_REPORT_DIR:-$HOME/Videos/recordings}
+# ado is next to this script: a key binding of sway does not have ~/.local/bin in its PATH
+ADO=$(dirname "$(readlink -f "$0")")/ado
+MAX_SECONDS=120
+LIMIT_BYTES=${BUG_REPORT_LIMIT:-15728640}      # a GIF bigger than this is made again, smaller
+
+die() { notify-send -u critical -a bug-report "Bug report" "$*"; echo "bug-report: $*" >&2; exit 1; }
+
+# the comment block at the top of this file, without the "# "
+usage() { sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//'; }
+
+# --- what it is about, and what the screen looks like -----------------------------------------------
+
+# targets: "number TAB what" for your work items, the ones you used last first
+# (stops with the reason when ado cannot list them, for example when az needs a new sign-in)
+targets() {
+    local raw
+    raw=$("$ADO" menu --raw 2>&1) || die "ado could not list your work items: ${raw##*$'\n'}"
+    gawk -F'\t' '$3 == "item" {print $4 "\t" $2}' <<< "$raw"
+}
+
+# choose_target: pick one in fuzzel; prints "number TAB what" (fails when you close it)
+choose_target() {
+    local list choice
+    list=$(targets) || exit 1
+    if [ -z "$list" ]; then
+        die "no work items of yours found"
+    fi
+    choice=$(cut -f2 <<< "$list" | fuzzel --dmenu --index --prompt 'bug under> ' --width 100 --lines 12) || return 1
+    sed -n "$((choice + 1))p" <<< "$list"
+}
+
+# choose_region: the area of the screen, "x,y wxh"
+choose_region() {
+    if [ -n "${BUG_REPORT_REGION:-}" ]; then
+        echo "$BUG_REPORT_REGION"
+    else
+        slurp
+    fi
+}
+
+# capture_context: what is true now, as "label TAB value" lines: the branch and commit of your clone, the window you are
+# working in and the screen. This is done first, while that window still has the focus.
+capture_context() {
+    local clone branch commit changes window screen
+    if clone=$("$ADO" clone 2>/dev/null); then
+        branch=$(git -C "$clone" branch --show-current 2>/dev/null)
+        commit=$(git -C "$clone" rev-parse --short HEAD 2>/dev/null)
+        changes=""
+        if [ -n "$(git -C "$clone" status --porcelain 2>/dev/null)" ]; then
+            changes="  (uncommitted changes)"
+        fi
+        printf 'Branch\t%s at %s%s\n' "${branch:-(no branch)}" "$commit" "$changes"
+    fi
+    window=$(swaymsg -t get_tree 2>/dev/null | jq -r '
+        [.. | objects | select(.focused? == true and (.type? == "con" or .type? == "floating_con"))] | first
+        | select(. != null) | "\(.app_id // .window_properties.class // "?")  -  \(.name // "")"' 2>/dev/null | tr '\t\n' '  ')
+    if [ -n "$window" ]; then
+        printf 'Window\t%s\n' "$window"
+    fi
+    screen=$(swaymsg -t get_outputs 2>/dev/null | jq -r '(first(.[] | select(.focused)) // .[0]) | select(. != null) | "\(.rect.width)x\(.rect.height) at scale \(.scale)"' 2>/dev/null)
+    if [ -n "$screen" ]; then
+        printf 'Screen\t%s\n' "$screen"
+    fi
+}
+
+# context_for WHAT REGION CAPTURED: all the lines ("label TAB value") that go with a bug: what it is under, what
+# capture_context found, the area and the time
+context_for() {
+    printf 'Work item\t%s\n' "$1"
+    if [ -n "$3" ]; then
+        printf '%s\n' "$3"
+    fi
+    printf 'Area\t%s\n' "$2"
+    printf 'Recorded\t%s\n' "$(date '+%Y-%m-%d %H:%M')"
+}
+
+# context_text CONTEXT: the lines as they are shown to you before anything is sent
+context_text() { gawk -F'\t' '{printf "%s: %s\n", $1, $2}' <<< "$1"; }
+
+# context_html CONTEXT: the lines as the description of the Dev Bug
+context_html() {
+    jq -Rrs '"<p>Made with bug-report.</p><ul>" + (split("\n") | map(select(. != "") | split("\t") | "<li><b>\(.[0] | @html):</b> \(.[1] | @html)</li>") | join("")) + "</ul>"' <<< "$1"
+}
+
+# --- the recording ----------------------------------------------------------------------------------
+
+# make_gif RECORDING GIF: a GIF with its own palette, as small as it needs to be: 720 pixels wide at 10 pictures a
+# second, then narrower and slower while it is over LIMIT_BYTES. Status 0: it fits, 2: it is still too big after the
+# smallest try, 1: ffmpeg failed.
+make_gif() {
+    local setting width fps
+    for setting in "720 10" "560 8" "420 6"; do
+        read -r width fps <<< "$setting"
+        ffmpeg -v error -y -i "$1" -vf "fps=$fps,scale='min($width,iw)':-1:flags=lanczos,split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5" "$2" || return 1
+        if [ "$(stat -c %s "$2")" -le "$LIMIT_BYTES" ]; then
+            return 0
+        fi
+    done
+    return 2
+}
+
+# stop_recording: end the recording that is running and wait until its file is finished
+stop_recording() {
+    local pid waited=0
+    pid=$(cat "$STATE/pid" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill -INT "$pid"
+        while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 100 ]; do
+            sleep 0.1
+            waited=$((waited + 1))
+        done
+    fi
+}
+
+# --- the Dev Bug ------------------------------------------------------------------------------------
+
+# make_bug FILE NUMBER CONTEXT: ask for the title, show what will be sent, and after a yes make the Dev Bug under work
+# item NUMBER with FILE on it
+make_bug() {
+    local file=$1 number=$2 context=$3 title answer out bug page size
+    size=$(stat -c %s "$file")
+    title=$(fuzzel --dmenu --lines 0 --prompt 'what is wrong? (the title of the Dev Bug)> ' --width 100 < /dev/null) || title=""
+    if [ -z "$title" ]; then
+        title="Bug found while working on #$number"
+    fi
+    answer=$(printf 'No\nYes\n' | fuzzel --dmenu --index --mesg "$(context_text "$context")" --width 100 --lines 2 \
+        --prompt "Make the Dev Bug \"$(cut -c1-50 <<< "$title")\" under #$number, with $(basename "$file") ($((size / 1024)) KiB)? ") || answer=0
+    if [ "$answer" != 1 ]; then
+        notify-send -a bug-report "No Dev Bug made" "the file is in $file"
+        exit 0
+    fi
+
+    if ! out=$("$ADO" new --type devbug --title "$title" --parent "$number" --assign none \
+                          --description "$(context_html "$context")" --yes 2>&1); then
+        die "could not make the Dev Bug: ${out##*$'\n'} (the file is in $file)"
+    fi
+    bug=$(sed -n 's/^created .* \([0-9][0-9]*\): .*/\1/p' <<< "$out" | head -n 1)
+    page=${out##*$'\n'}
+    if [ -z "$bug" ]; then
+        die "the Dev Bug may be made, but its number is unknown: ${out%%$'\n'*} (the file is in $file)"
+    fi
+    if ! out=$("$ADO" attach "$file" --item "$bug" --yes 2>&1); then
+        # the bug is there, only the file is not: say so, with the page of the bug
+        setsid -f "$ADO" notify critical "Dev Bug $bug made, but the file is not attached" "${out##*$'\n'} (it is in $file)" "$page" >/dev/null 2>&1
+        exit 1
+    fi
+    # a click on the notification opens the Dev Bug
+    setsid -f "$ADO" notify normal "Dev Bug $bug made under #$number" "$title" "${out##*$'\n'}" >/dev/null 2>&1
+}
+
+# start: choose what it is about and what to record, and start recording
+start() {
+    local captured target region
+    captured=$(capture_context)
+    target=$(choose_target) || exit 0
+    region=$(choose_region) || exit 0
+    [ -n "$region" ] || exit 0
+    mkdir -p "$STATE" "$DIR"
+    rm -f "$STATE/rec.mp4"
+    printf '%s\n' "$target" > "$STATE/target"
+    printf '%s\n' "$region" > "$STATE/region"
+    printf '%s\n' "$captured" > "$STATE/context"
+    # detached, so that it goes on when this script is over; the pid is that of timeout, which passes a stop on
+    setsid -f bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$STATE/pid" \
+        timeout "$MAX_SECONDS" wf-recorder -g "$region" -f "$STATE/rec.mp4" >/dev/null 2>&1
+    sleep 0.5
+    notify-send -a bug-report -t 3000 "Recording a bug under #$(cut -f1 <<< "$target")" "Run bug-report again to stop"
+}
+
+# finish: stop, make the GIF, and make the Dev Bug of it
+finish() {
+    local number what region captured file status
+    IFS=$'\t' read -r number what < "$STATE/target"
+    region=$(cat "$STATE/region")
+    captured=$(cat "$STATE/context")
+    stop_recording
+    if [ ! -s "$STATE/rec.mp4" ]; then
+        rm -rf "$STATE"
+        die "the recording is empty"
+    fi
+    mkdir -p "$DIR"
+    file="$DIR/bug-$(date +%Y%m%d-%H%M%S)"
+    notify-send -a bug-report -t 2000 "Making the GIF" "one moment"
+    make_gif "$STATE/rec.mp4" "$file.gif"
+    status=$?
+    case $status in
+        0) file=$file.gif ;;
+        2) # still over the limit after the smallest try: the video (much smaller) is attached instead of the GIF
+           rm -f "$file.gif"
+           cp "$STATE/rec.mp4" "$file.mp4"
+           file=$file.mp4 ;;
+        *) die "ffmpeg could not make the GIF" ;;
+    esac
+    rm -rf "$STATE"
+    make_bug "$file" "$number" "$(context_for "$what" "$region" "$captured")"
+}
+
+# shot: choose what it is about and what to take a picture of, and make the Dev Bug of it
+shot() {
+    local captured target region file number what
+    captured=$(capture_context)
+    target=$(choose_target) || exit 0
+    region=$(choose_region) || exit 0
+    [ -n "$region" ] || exit 0
+    mkdir -p "$DIR"
+    sleep 0.3                    # until the selection has gone from the screen
+    file="$DIR/bug-$(date +%Y%m%d-%H%M%S).png"
+    grim -g "$region" "$file" || die "grim could not take the picture"
+    IFS=$'\t' read -r number what <<< "$target"
+    make_bug "$file" "$number" "$(context_for "$what" "$region" "$captured")"
+}
+
+# --- main -------------------------------------------------------------------------------------------
+
+case ${1:-} in
+    -h|--help|help) usage; exit 0 ;;
+    --shot)         shot; exit 0 ;;
+    --cancel)
+        stop_recording
+        rm -rf "$STATE"
+        notify-send -a bug-report -t 2000 "Recording thrown away"
+        exit 0
+        ;;
+esac
+
+if [ -f "$STATE/target" ]; then
+    finish
+else
+    start
+fi
