@@ -1,7 +1,7 @@
 #!/bin/bash
 # teams: a first, small Teams client for the terminal, on the Microsoft Graph API (curl + jq).
 #
-#   teams login             sign in (device code flow)
+#   teams login             sign in (device code flow): the page opens in Firefox and the code is copied
 #   teams chats             your chats, newest first; * marks a chat with unread messages
 #   teams unread            the number of chats with unread messages (for the status bar)
 #   teams read N [COUNT]    the last COUNT messages (default 15) of chat number N from `teams chats`
@@ -17,6 +17,7 @@
 #
 # The refresh token is kept in the keyring (secret-tool); access tokens are cached in $XDG_RUNTIME_DIR.
 # Overrides, mostly for testing: TEAMS_CONFIG, TEAMS_KEYRING_SERVICE, TEAMS_GRAPH, TEAMS_LOGIN_HOST.
+# TEAMS_NO_BROWSER=1 stops teams login from opening the page and copying the code.
 
 CONFIG=${TEAMS_CONFIG:-$HOME/.config/teams/config}
 KEYRING_SERVICE=${TEAMS_KEYRING_SERVICE:-teams}
@@ -63,6 +64,27 @@ save_tokens() {
     chmod 600 "$CACHE/access"
 }
 
+# open_page URL: open it in Firefox and bring that window to the front (sway does not let a new tab take the focus by
+# itself, so the page would open out of sight)
+open_page() {
+    setsid firefox "$1" >/dev/null 2>&1 &
+    sleep 0.4
+    swaymsg '[app_id="org.mozilla.firefox"] focus' >/dev/null 2>&1
+}
+
+# show_login_page RESPONSE: open the page of the device code flow and put the code on the clipboard, so that signing in
+# is a paste (not when TEAMS_NO_BROWSER is set, or when there is no Firefox)
+show_login_page() {
+    if [ -n "${TEAMS_NO_BROWSER:-}" ] || ! command -v firefox >/dev/null; then
+        return 0
+    fi
+    if command -v wl-copy >/dev/null; then
+        jq -j '.user_code' <<< "$1" | wl-copy
+    fi
+    open_page "$(jq -r '.verification_uri' <<< "$1")"
+    echo "(the page is open in Firefox, and the code is on the clipboard)"
+}
+
 login() {
     local response device_code interval json error
     response=$(curl -sS -X POST "$AUTH/devicecode" -d client_id="$CLIENT_ID" --data-urlencode "scope=$SCOPE") \
@@ -71,6 +93,7 @@ login() {
     [ -n "$device_code" ] || die "could not start the sign-in: $(login_error "$response")"
 
     jq -r '.message' <<< "$response"        # "To sign in, open <page> and enter the code <code>"
+    show_login_page "$response"
     interval=$(jq -r '.interval // 5' <<< "$response")
 
     while sleep "$interval"; do
