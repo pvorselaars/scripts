@@ -34,7 +34,8 @@ Most take `--print` to list what the menu would show.
 | `sloc FILE` | Count the lines that are not blank |
 | `prof`, `bench`, `bench-new` | Profiling and benchmarking; see `PROFILING.md` |
 | `bib-add` | Add a book to the bibliography by ISBN or by searching Open Library |
-| `ado` | Azure DevOps at a glance via `az login`: pull requests (also the ones a team of yours has to review), failed runs, your work items, and creating a branch for a work item (pick the item with fzf when you give no number) |
+| `ado` | Azure DevOps at a glance via `az login`: pull requests (also the ones a team of yours has to review), failed runs, your work items, creating a branch for a work item (pick the item with fzf when you give no number), voting on and reading the comments of a pull request, re-running a failed run, changing the state of a work item, creating work items (also a task under an item) and looking at the sprint of your team, creating a pull request from a branch or a work item, replying to and resolving comment threads, auto-complete, undoing the last vote or state change, starting work on an item (branch, state and a terminal on the branch in one go), notifications for new reviews, votes, comments and failed runs, and a fuzzel menu with all of it (Enter for actions, search for work items, recent picks first) |
+| `notification-history` | Browse the notifications mako has dismissed in fuzzel; picking one copies its text |
 | `teams` | A small Teams client on Microsoft Graph: chats, unread, read, send. Needs an Entra app registration (see its header) |
 | `stow DIR` | Link every item of `DIR` into the current folder |
 
