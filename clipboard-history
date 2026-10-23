@@ -1,0 +1,135 @@
+#!/bin/bash
+# clipboard-history: pick something you copied before, in rofi, and put it back on the clipboard. cliphist keeps the
+# history (sway runs `wl-paste --watch cliphist store`); images and GIFs are shown as small pictures.
+#
+#   clipboard-history            pick an entry: Enter puts it back on the clipboard, Alt+d deletes it from the history,
+#                                Alt+i switches to a grid of the images (and back)
+#   clipboard-history --images   the same, starting with the grid of the images
+#   clipboard-history --print    list the entries (the newest first) without the menu
+#   clipboard-history --thumb ID make the small picture of an image entry (the menu runs this itself)
+#
+# h j k l and the arrows move, Escape or q closes (rofi's config.rasi, and the keys below).
+# The pictures are kept in $XDG_RUNTIME_DIR/clipboard-history.
+# Overrides, mostly for testing: CLIPHIST_DB (the history), CLIPBOARD_CACHE (the pictures).
+
+DB=${CLIPHIST_DB:-$HOME/.cache/cliphist/db}
+CACHE=${CLIPBOARD_CACHE:-${XDG_RUNTIME_DIR:-/tmp}/clipboard-history}
+LIMIT=100                       # how many entries the menu shows
+THEME=$HOME/.config/rofi/onedark.rasi
+SELF=$(readlink -f "$0")
+KEYS=(-kb-row-down "Down,j,Control+j,Control+n" -kb-row-up "Up,k,Control+k,Control+p"
+      -kb-row-left "Left,h,Control+h" -kb-row-right "Right,l,Control+l" -kb-cancel "Escape,q,Control+g,Control+bracketleft"
+      -kb-custom-1 "Alt+d" -kb-custom-2 "Alt+i")
+
+die() { echo "clipboard-history: $*" >&2; exit 1; }
+
+# the comment block at the top of this file, without the "# "
+usage() { sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//'; }
+
+# history COMMAND...: cliphist, with the history of this script
+history() { cliphist -db-path "$DB" "$@"; }
+
+# entries: the newest entries as cliphist lists them: "id TAB what it is" (an image: [[ binary data 723 KiB gif 358x360 ]])
+entries() { history list | head -n "$LIMIT"; }
+
+# cmd_thumb ID: make the small picture of an image entry (the first picture of a GIF)
+cmd_thumb() {
+    mkdir -p "$CACHE/thumbs"
+    history decode "$1" | magick '-[0]' -thumbnail '256x256>' "png:$CACHE/thumbs/$1.png" 2>/dev/null
+}
+
+# make_thumbs ENTRIES: the pictures that are not there yet, four at a time
+make_thumbs() {
+    mkdir -p "$CACHE/thumbs"
+    gawk -F'\t' '$2 ~ /^\[\[ binary data/ {print $1}' <<< "$1" | while read -r id; do
+        if [ ! -s "$CACHE/thumbs/$id.png" ]; then
+            echo "$id"
+        fi
+    done | xargs -r -P 4 -n 1 "$SELF" --thumb
+}
+
+# rows ENTRIES MODE: the rows for rofi: the text of an entry, or for an image what it is (in the list: "image ...") and,
+# after a NUL, its picture
+rows() {
+    local id what word="image  "
+    if [ "$2" = images ]; then
+        word=""
+    fi
+    while IFS=$'\t' read -r id what; do
+        if [[ $what == "[[ binary data "* ]]; then
+            what=${what#"[[ binary data "}
+            printf '%s%s\0icon\x1f%s\n' "$word" "${what% ]]}" "$CACHE/thumbs/$id.png"
+        else
+            printf '%s\n' "$what"
+        fi
+    done <<< "$1"
+}
+
+# menu SELECTED MODE: choose one row of stdin; prints its number. Status 10 is Alt+d (delete), 11 is Alt+i (the other
+# view). The list has one row per entry; the images view is a grid of the images, with big pictures.
+menu() {
+    local theme='window {width: 60%;} listview {lines: 12;} element-icon {size: 3em;}'
+    if [ "$2" = images ]; then
+        theme='window {width: 58%; height: 50%;} listview {columns: 4; lines: 3; flow: horizontal; spacing: 8px;}
+               element {orientation: vertical; padding: 6px;} element-icon {size: 8em;} element-text {horizontal-align: 0.5;}'
+    fi
+    rofi -dmenu -i -no-custom -show-icons -format i -p 'clip>' -theme "$THEME" -selected-row "$1" "${KEYS[@]}" \
+        -theme-str "$theme"
+}
+
+# --- main -------------------------------------------------------------------------------------------
+
+case ${1:-} in
+    -h|--help|help) usage; exit 0 ;;
+    --thumb)        cmd_thumb "${2:?an entry number is needed}"; exit 0 ;;
+    --print)        entries | cut -f2; exit 0 ;;
+    --images)       start=images ;;
+esac
+
+selected=0
+mode=${start:-list}
+while true; do
+    list=$(entries)
+    if [ -z "$list" ]; then
+        notify-send -a clipboard -t 2000 "The clipboard history is empty"
+        exit 0
+    fi
+    shown=$list
+    if [ "$mode" = images ]; then
+        shown=$(grep -F $'\t[[ binary data ' <<< "$list")
+    fi
+    make_thumbs "$shown"
+    choice=$(rows "$shown" "$mode" | menu "$selected" "$mode")
+    status=$?
+    case $status in
+        0|10|11) ;;
+        *)       exit 0 ;;
+    esac
+    line=$(sed -n "$((choice + 1))p" <<< "$shown")
+    if [ "$status" = 11 ]; then
+        # Alt+i: the other view (the images only when there are some)
+        selected=0
+        if [ "$mode" = images ]; then
+            mode=list
+        elif grep -qF $'\t[[ binary data ' <<< "$list"; then
+            mode=images
+        else
+            notify-send -a clipboard -t 1500 "No images in the clipboard history"
+        fi
+        continue
+    fi
+    if [ "$status" = 10 ]; then
+        # Alt+d: forget it, and stay where you were
+        printf '%s\n' "$line" | history delete
+        selected=$choice
+        continue
+    fi
+    history decode "${line%%$'\t'*}" | wl-copy
+    what=${line#*$'\t'}
+    if [[ $what == "[[ binary data "* ]]; then
+        what=${what#"[[ binary data "}
+        what="image ${what% ]]}"
+    fi
+    notify-send -a clipboard -t 1200 "Copied" "${what:0:80}"
+    exit 0
+done
