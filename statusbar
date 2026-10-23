@@ -7,6 +7,7 @@
 #   - cpu, ram and disk when high; battery when low
 #   - brightness and volume for a few seconds after a change
 #   - a power profile icon, unless it is balanced
+#   - Azure DevOps: pull requests waiting for you and failed runs of yours (see `ado`)
 #   - network when there is traffic, bluetooth while a device is connected
 #   - wifi only while offline
 # Send SIGUSR1 (see statusbar-refresh) to redraw immediately.
@@ -273,6 +274,29 @@ battery() {
     fi
 }
 
+# Azure DevOps: pull requests waiting for your review (orange) and failed pipeline runs of yours (red).
+# `ado refresh` writes the numbers every few minutes (a systemd timer); this module only reads them.
+# A key means that az needs a new sign-in, or that the numbers have not been refreshed for a while.
+devops() {
+    local file="${XDG_RUNTIME_DIR:-/tmp}/ado/summary.json" error at review failed shown=()
+    [ -r "$file" ] || return
+    read -r error at review failed < <(jq -r '[(.error // "-"), (.at // 0), (.review // 0), (.failed // 0)] | join(" ")' "$file")
+
+    if [ "$error" != "-" ] || [ $(( $(date +%s) - at )) -gt 1200 ]; then
+        paint "$DIM" $'\U000F0306'      # key
+        return
+    fi
+    [ "$review" -gt 0 ] && shown+=("<span foreground=\"$ORANGE\">"$'\U000F062C'" $review</span>")     # branch
+    [ "$failed" -gt 0 ] && shown+=("<span foreground=\"$RED\">"$'\U000F0028'" $failed</span>")        # alert circle
+
+    if [ "${#shown[@]}" -gt 0 ]; then
+        res="${shown[0]}"
+        [ "${#shown[@]}" -gt 1 ] && res+=" ${shown[1]}"
+    elif [ "$all" = 1 ]; then
+        paint "$DIM" $'\U000F062C'" 0"
+    fi
+}
+
 bluetooth() {
     local connected
     connected=$(timeout 1 bluetoothctl devices Connected 2>/dev/null | grep -c '^Device')
@@ -346,7 +370,7 @@ read_show_all() {
 # prints the whole status line: the modules that have something to show, then the clock
 draw() {
     local parts=() module line part
-    for module in rec pres cpu mem disk net brightness bluetooth wifi volume dnd profile battery media; do
+    for module in rec pres cpu mem disk net brightness bluetooth wifi volume dnd profile battery devops media; do
         res=""
         $module
         [ -n "$res" ] && parts+=("$res")
