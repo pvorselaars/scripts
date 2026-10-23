@@ -40,6 +40,8 @@
 #                            the git commands)
 #   ado rerun [RUN_ID]       queue a run of a pipeline again on the same branch; without an id, pick one of
 #                            your failed runs (--yes skips the question)
+#   ado attach FILE          put a file (a screenshot, a GIF of a bug) on a work item (--item ID) or a pull request
+#                            (--pr NUMBER), with the picture in a comment, after --text if you give it (--yes, --plan)
 #   ado undo                 take back the last vote, state change or auto-complete (for 30 minutes)
 #
 # Menu and background
@@ -242,7 +244,7 @@ api_send() {
         return 0
     fi
     token=$(token) || return 1
-    response=$(curl -sS -X "$method" -H "Authorization: Bearer $token" -H "Content-Type: $type" -d "$body" \
+    response=$(curl -sS -X "$method" -H "Authorization: Bearer $token" -H "Content-Type: $type" --data-binary "$body" \
         -w $'\n%{http_code}' "$API/$ORG$path") || { echo "ado: could not reach Azure DevOps" >&2; return 1; }
     status=${response##*$'\n'}
     response=${response%$'\n'*}
@@ -1408,6 +1410,81 @@ cmd_rerun() {
 }
 
 
+# cmd_attach FILE (--item ID | --pr NUMBER) [--text TEXT] [--yes] [--plan]: put a file (a screenshot, a GIF of a bug) on
+# a work item or a pull request, with the picture itself in a comment, after the text if there is one. The last line it
+# prints is the page of the work item or the pull request. --plan only says what it would do.
+cmd_attach() {
+    local file="" item="" pr_id="" text="" yes=0 plan=0 name size picture target page project repo_item pr uploaded url ops body base
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --item) item=${2#\#}; shift ;;
+            --pr)   pr_id=${2#!}; shift ;;
+            --text) text=${2:-}; shift ;;
+            --yes)  yes=1 ;;
+            --plan) plan=1 ;;
+            -*)     die "unknown option $1 (ado --help)" ;;
+            *)      file=$1 ;;
+        esac
+        shift
+    done
+    [ -r "$file" ] || die "usage: ado attach FILE (--item ID | --pr NUMBER) [--text TEXT] [--yes] [--plan]"
+    if [ -z "$item" ] && [ -z "$pr_id" ]; then die "say where it goes: --item ID or --pr NUMBER"; fi
+    if [ -n "$item" ] && [ -n "$pr_id" ]; then die "--item or --pr, not both"; fi
+    name=$(basename "$file")
+    size=$(stat -c %s "$file")
+    if [ "$size" -gt 62914560 ]; then die "$name is $((size / 1048576)) MB: Azure DevOps takes at most 60 MB"; fi
+    # a picture is shown in the comment itself, anything else (a video) as a link
+    picture=no
+    case ${name,,} in
+        *.gif|*.png|*.jpg|*.jpeg|*.webp) picture=yes ;;
+    esac
+
+    # where it goes, and the page of that
+    if [ -n "$item" ]; then
+        [[ $item =~ ^[0-9]+$ ]] || die "--item needs a work item number"
+        repo_item=$(work_item "$item") || die "there is no work item $item (or no access to it)"
+        target="work item $item  $(item_field "$repo_item" Title)"
+        project=$(item_field "$repo_item" TeamProject)
+        page="https://dev.azure.com/$ORG/$(url_part "$project")/_workitems/edit/$item"
+    else
+        [[ $pr_id =~ ^[0-9]+$ ]] || die "--pr needs a pull request number"
+        pr=$(pr_json "$pr_id") || die "there is no pull request $pr_id (or no access to it)"
+        target="pull request !$pr_id  $(jq -r .title <<< "$pr")"
+        page=$(jq -r --arg org "$ORG" '"https://dev.azure.com/\($org)/\(.repository.project.name | @uri)/_git/\(.repository.name | @uri)/pullrequest/\(.pullRequestId)"' <<< "$pr")
+    fi
+    if [ "$plan" = 1 ]; then
+        echo "$name ($((size / 1024)) KiB) to $target"
+        return
+    fi
+    confirm_cli "Attach $name ($((size / 1024)) KiB) to $target?" "$yes" || { echo "not attached"; return; }
+
+    if [ -n "$item" ]; then
+        uploaded=$(api_send POST "/_apis/wit/attachments?fileName=$(url_part "$name")&api-version=7.1" "@$file" application/octet-stream) || exit 1
+        url=$(jq -r '.url // "(its address)"' <<< "$uploaded")
+        # the file is attached, and the picture (or for a video a link to it) is in the discussion, after the text
+        ops=$(jq -n --arg url "$url" --arg text "$text" --arg name "$name" --arg picture "$picture" '
+            [{op: "add", path: "/relations/-", value: {rel: "AttachedFile", url: $url, attributes: {comment: $text}}},
+             {op: "add", path: "/fields/System.History",
+              value: ((if $text != "" then "<p>\($text | @html)</p>" else "" end)
+                      + (if $picture == "yes" then "<img src=\"\($url | @html)\" alt=\"\($name | @html)\">"
+                         else "<a href=\"\($url | @html)\">\($name | @html)</a>" end))}]')
+        api_send PATCH "/_apis/wit/workitems/$item?api-version=7.1" "$ops" application/json-patch+json >/dev/null || exit 1
+        echo "attached $name to work item $item"
+    else
+        base=$(pr_base "$pr")
+        uploaded=$(api_send POST "$base/pullRequests/$pr_id/attachments/$(url_part "$name")?api-version=7.1" "@$file" application/octet-stream) || exit 1
+        url=$(jq -r '.url // "(its address)"' <<< "$uploaded")
+        body=$(jq -n --arg url "$url" --arg text "$text" --arg name "$name" --arg picture "$picture" \
+            '{comments: [{parentCommentId: 0, commentType: 1,
+                          content: ((if $text != "" then $text + "\n\n" else "" end)
+                                    + (if $picture == "yes" then "![\($name)](\($url))" else "[\($name)](\($url))" end))}],
+              status: "active"}')
+        api_send POST "$base/pullRequests/$pr_id/threads?api-version=7.1" "$body" >/dev/null || exit 1
+        echo "attached $name to pull request !$pr_id"
+    fi
+    echo "$page"
+}
+
 # --- undo ---------------------------------------------------------------------------------------
 
 # record_undo DESCRIPTION ARGS...: remember how to take back what was just done; ARGS are the arguments of ado that
@@ -1842,7 +1919,8 @@ cmd_notify() {
         notify-send -a ado -u "$1" "$2" "$3"
         return
     fi
-    answer=$(notify-send -a ado -u "$1" -A "default=Open" "$2" "$3") || return 0
+    # the category is where the page is kept: mako keeps it in its history (notification-history opens it from there)
+    answer=$(notify-send -a ado -u "$1" -c "url:$4" -A "default=Open" "$2" "$3") || return 0
     if [ "$answer" = default ]; then
         open_url "$4"
     fi
@@ -1907,13 +1985,14 @@ if [ $# -gt 0 ]; then shift; fi
 
 case $command in
     ""|-h|--help|help) usage; exit 0 ;;
-    prs|runs|items|item|branch|sprint|new|start|pr|vote|comments|reply|resolve|complete|checkout|rerun|state|undo|menu|refresh|notify|status) ;;
+    prs|runs|items|item|branch|sprint|new|start|pr|vote|comments|reply|resolve|complete|checkout|rerun|state|undo|menu|refresh|notify|attach|status) ;;
     *) die "unknown command '$command' (ado --help)" ;;
 esac
 
 load_config
 case $command in
     notify)   cmd_notify "$@" ;;
+    attach)   cmd_attach "$@" ;;
     sprint)   cmd_sprint "$@" ;;
     new)      cmd_new "$@" ;;
     start)    cmd_start "$@" ;;
