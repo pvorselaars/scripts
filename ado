@@ -14,6 +14,14 @@
 #   ado start [ID]           start work on a work item: create its branch (linked), move it to In Progress (or
 #                            Committed) and open a terminal on the branch in your clone (--plan: only say what
 #                            it would do, --yes, --no-terminal)
+#   ado pr [--item ID]       create a pull request from the branch you are in (or the branch of a work item):
+#                            to the default branch, linked to the work item, titled FEATURE [ID] title
+#                            (--draft, --title, --description, --target, --plan, --yes, --open)
+#   ado complete NUMBER      complete a pull request by itself when it may (squash, branch deleted, see
+#                            MERGE_STRATEGY); --cancel takes it back, --keep-branch, --strategy, --yes
+#   ado reply NUMBER THREAD TEXT...  add a comment to a comment thread (the thread numbers: ado comments)
+#   ado resolve NUMBER THREAD        resolve a thread (--wontfix, --reactivate)
+#   ado undo                 take back the last vote, state change or auto-complete (for 30 minutes)
 #   ado vote NUMBER WORD     vote on a pull request: approve, suggest (approve with suggestions), wait (for the
 #                            author), reject or reset; asks first (--yes skips the question)
 #   ado comments [NUMBER]    the open comment threads of a pull request; without a number, of your own PRs
@@ -52,6 +60,7 @@
 #   IGNORE_GROUPS=Testers                        words in team names that must not make a PR wait for you
 #   ITEM_STATES=Committed|In Progress|To Do      the states that mean a work item is being worked on (| between them)
 #   START_STATES=In Progress|Committed           where ado start moves a work item to: the first of these its type has
+#   MERGE_STRATEGY=squash                        how ado complete merges: squash, noFastForward, rebase or rebaseMerge
 #   CLONE=~/Projects/x/repo                      the clone ado start opens a terminal in (else the folder you are in,
 #                                                or a clone of the repo found in ~/Projects)
 #   NOTIFY=1                                     0: ado refresh does not send notifications
@@ -67,6 +76,9 @@ API=${ADO_API:-https://dev.azure.com}
 VSSPS=${ADO_VSSPS:-https://vssps.dev.azure.com}
 RESOURCE=499b84ac-1321-427f-aa17-267ca6975798     # the Azure DevOps resource: what az needs to know
 SELF=$(readlink -f "$0")                          # this script, for the preview of fzf and the menu actions
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/ado   # what is remembered between runs: recent picks, the last change
+UNDO=$STATE_DIR/undo
+UNDO_MINUTES=30                                   # how long the last change can be undone
 
 die() { echo "ado: $*" >&2; exit 1; }
 
@@ -84,11 +96,12 @@ load_config() {
     ITEM_STATES="Committed|In Progress|To Do"
     START_STATES="In Progress|Committed"
     CLONE=""
+    MERGE_STRATEGY=squash
     NOTIFY=1
     NUDGE_REVIEW_HOURS=24
     NUDGE_PR_DAYS=2
     if [ -r "$CONFIG" ]; then
-        for name in ORG PROJECTS REPO IGNORE_GROUPS ITEM_STATES START_STATES CLONE NOTIFY NUDGE_REVIEW_HOURS NUDGE_PR_DAYS; do
+        for name in ORG PROJECTS REPO IGNORE_GROUPS ITEM_STATES START_STATES CLONE MERGE_STRATEGY NOTIFY NUDGE_REVIEW_HOURS NUDGE_PR_DAYS; do
             value=$(sed -n "s/^$name=//p" "$CONFIG" | head -n 1)
             [ -n "$value" ] && printf -v "$name" '%s' "$value"
         done
@@ -642,7 +655,7 @@ pr_threads() {
 
 # thread_line: from threads (JSON lines) on stdin, one text line each: file:line, who, what, replies
 thread_line() {
-    jq -r '"\(.file // "(general)")\(if .line then ":\(.line)" else "" end)  \(.author): \(.text | gsub("\\s+"; " ") | .[0:90])\(if .replies > 0 then "  (+\(.replies))" else "" end)"'
+    jq -r '"#\(.id)  \(.file // "(general)")\(if .line then ":\(.line)" else "" end)  \(.author): \(.text | gsub("\\s+"; " ") | .[0:90])\(if .replies > 0 then "  (+\(.replies))" else "" end)"'
 }
 
 # vote_value WORD: the number Azure DevOps keeps for a vote (fails for an unknown word)
@@ -657,6 +670,17 @@ vote_value() {
     esac
 }
 
+# vote_word NUMBER: the word for a vote number (the other way round from vote_value)
+vote_word() {
+    case $1 in
+        10)  echo approve ;;
+        5)   echo suggest ;;
+        -5)  echo wait ;;
+        -10) echo reject ;;
+        *)   echo reset ;;
+    esac
+}
+
 vote_text() {
     case $1 in
         approve) echo "approved" ;;
@@ -668,7 +692,7 @@ vote_text() {
 }
 
 cmd_vote() {
-    local id="" word="" yes=0 arg value pr title me
+    local id="" word="" yes=0 arg value pr title me previous
     for arg in "$@"; do
         case $arg in
             --yes) yes=1 ;;
@@ -682,8 +706,10 @@ cmd_vote() {
     title=$(jq -r .title <<< "$pr")
     confirm_cli "Vote '$word' on !$id  $title?" "$yes" || { echo "not voted"; return; }
     me=$(my_id) || exit 1
+    previous=$(jq -r --arg me "$me" '[.reviewers[]? | select(.id == $me) | .vote][0] // 0' <<< "$pr")
     api_send PUT "/$(jq -r .repository.project.id <<< "$pr")/_apis/git/repositories/$(jq -r .repository.id <<< "$pr")/pullrequests/$id/reviewers/$me?api-version=7.1" \
         "$(jq -n --argjson vote "$value" '{vote: $vote}')" >/dev/null || exit 1
+    record_undo "$(vote_text "$word") !$id" vote "$id" "$(vote_word "$previous")" --yes
     echo "$(vote_text "$word"): !$id  $title"
 }
 
@@ -808,7 +834,220 @@ cmd_state() {
 
     body=$(jq -n --arg state "$match" '[{op: "add", path: "/fields/System.State", value: $state}]')
     api_send PATCH "/_apis/wit/workitems/$id?api-version=7.1" "$body" application/json-patch+json >/dev/null || exit 1
+    record_undo "work item $id: $current -> $match" state "$id" "$current" --yes
     echo "work item $id: $current -> $match  $title"
+}
+
+# --- replying, completing, creating pull requests; undo -------------------------------------------------
+
+# pr_target NUMBER: "PROJECT_ID TAB REPO_ID TAB TITLE" of a pull request (fails when there is none)
+pr_target() {
+    local out
+    out=$(pr_json "$1" 2>/dev/null | jq -r '[.repository.project.id, .repository.id, .title] | @tsv')
+    [ -n "$out" ] || return 1
+    echo "$out"
+}
+
+# cmd_reply NUMBER THREAD TEXT...: add a comment to a thread of a pull request (the thread numbers are in ado comments)
+cmd_reply() {
+    local id=${1#!} thread=${2:-} text target project repo title
+    shift 2 2>/dev/null
+    text="$*"
+    [[ $id =~ ^[0-9]+$ ]] && [[ ${thread#\#} =~ ^[0-9]+$ ]] && [ -n "$text" ] || die "usage: ado reply NUMBER THREAD TEXT..."
+    thread=${thread#\#}
+    target=$(pr_target "$id") || die "there is no pull request $id (or no access to it)"
+    IFS=$'\t' read -r project repo title <<< "$target"
+    api_send POST "/$project/_apis/git/repositories/$repo/pullRequests/$id/threads/$thread/comments?api-version=7.1" \
+        "$(jq -n --arg text "$text" '{content: $text, parentCommentId: 1, commentType: 1}')" >/dev/null || exit 1
+    echo "replied on thread $thread of !$id  $title"
+}
+
+# cmd_resolve NUMBER THREAD [--wontfix|--reactivate]: mark a thread of a pull request as resolved
+cmd_resolve() {
+    local id="" thread="" status=fixed arg target project repo title word=resolved
+    for arg in "$@"; do
+        case $arg in
+            --wontfix)    status=wontFix; word="closed as won't fix" ;;
+            --reactivate) status=active; word=reactivated ;;
+            -*)           die "unknown option $arg (ado --help)" ;;
+            *)            if [ -z "$id" ]; then id=${arg#!}; else thread=${arg#\#}; fi ;;
+        esac
+    done
+    [[ $id =~ ^[0-9]+$ ]] && [[ $thread =~ ^[0-9]+$ ]] || die "usage: ado resolve NUMBER THREAD [--wontfix|--reactivate]"
+    target=$(pr_target "$id") || die "there is no pull request $id (or no access to it)"
+    IFS=$'\t' read -r project repo title <<< "$target"
+    api_send PATCH "/$project/_apis/git/repositories/$repo/pullRequests/$id/threads/$thread?api-version=7.1" \
+        "$(jq -n --arg status "$status" '{status: $status}')" >/dev/null || exit 1
+    echo "thread $thread of !$id $word"
+}
+
+# cmd_complete NUMBER [--cancel] [--keep-branch] [--strategy S] [--yes]: complete a pull request by itself as soon as
+# it may be (reviews and builds are in), the way the website's "Set auto-complete" does. The branch is deleted
+# afterwards, and the merge is MERGE_STRATEGY (squash), unless you say otherwise. --cancel takes it back.
+cmd_complete() {
+    local id="" cancel=0 keep=0 strategy=$MERGE_STRATEGY yes=0 arg pr me title body delete=true
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --cancel)      cancel=1 ;;
+            --keep-branch) keep=1 ;;
+            --strategy)    strategy=${2:-}; shift ;;
+            --yes)         yes=1 ;;
+            -*)            die "unknown option $1 (ado --help)" ;;
+            *)             id=${1#!} ;;
+        esac
+        shift
+    done
+    [[ $id =~ ^[0-9]+$ ]] || die "usage: ado complete NUMBER [--cancel] [--keep-branch] [--strategy squash|noFastForward|rebase|rebaseMerge] [--yes]"
+    case $strategy in squash|noFastForward|rebase|rebaseMerge) ;; *) die "unknown merge strategy '$strategy'" ;; esac
+    pr=$(pr_json "$id") || die "there is no pull request $id (or no access to it)"
+    title=$(jq -r .title <<< "$pr")
+    [ "$(jq -r '.isDraft // false' <<< "$pr")" != true ] || die "!$id is a draft: publish it first"
+    [ "$keep" = 1 ] && delete=false
+
+    if [ "$cancel" = 1 ]; then
+        confirm_cli "Cancel auto-complete of !$id  $title?" "$yes" || { echo "not changed"; return; }
+        body='{"autoCompleteSetBy": {"id": "00000000-0000-0000-0000-000000000000"}}'
+    else
+        confirm_cli "Complete !$id  $title by itself when it may ($strategy, $([ "$keep" = 1 ] && echo "keep" || echo "delete") the branch)?" "$yes" \
+            || { echo "not changed"; return; }
+        me=$(my_id) || exit 1
+        body=$(jq -n --arg me "$me" --arg strategy "$strategy" --argjson delete "$delete" '
+            {autoCompleteSetBy: {id: $me},
+             completionOptions: ({mergeStrategy: $strategy, deleteSourceBranch: $delete}
+                                 + (if $strategy == "squash" then {squashMerge: true} else {} end))}')
+    fi
+    api_send PATCH "/$(jq -r .repository.project.id <<< "$pr")/_apis/git/repositories/$(jq -r .repository.id <<< "$pr")/pullrequests/$id?api-version=7.1" \
+        "$body" >/dev/null || exit 1
+    if [ "$cancel" = 1 ]; then
+        echo "auto-complete cancelled: !$id  $title"
+    else
+        record_undo "auto-complete of !$id" complete "$id" --cancel --yes
+        echo "will complete when ready: !$id  $title"
+    fi
+}
+
+# load_repo PROJECT/REPO: look a repo up. Sets REPO_PATH (the project as it goes into a URL), REPO_ID,
+# REPO_DEFAULT (its default branch) and REPO_HEADS (its branches, one per line).
+load_repo() {
+    local spec=$1 project name info
+    project=${spec%%/*}
+    name=${spec#*/}
+    [ "$project" != "$spec" ] || die "the repo has to be written as PROJECT/REPO, not '$spec'"
+    REPO_PATH=$(project_path "$project")
+    info=$(api "/$REPO_PATH/_apis/git/repositories/$name?api-version=7.1" 2>/dev/null) \
+        || die "there is no repo $spec (or no access to it)"
+    REPO_ID=$(jq -r .id <<< "$info")
+    REPO_DEFAULT=$(jq -r '.defaultBranch // empty | sub("^refs/heads/"; "")' <<< "$info")
+    REPO_HEADS=$(api "/$REPO_PATH/_apis/git/repositories/$REPO_ID/refs?filter=heads/&\$top=1000&api-version=7.1" |
+        jq -r '.value[].name | sub("^refs/heads/"; "")') || die "could not list the branches of $spec"
+}
+
+# cmd_pr [--item ID] [--draft] [--title T] [--description TEXT] [--target BRANCH] [--yes] [--plan] [--open]
+# Create a pull request from the branch you are in (the clone you are in), or with --item from the branch of a work
+# item. It goes to the default branch of the repo, is linked to the work item in the branch name, and is titled like
+# the others here: FEATURE [156438] title of the work item. --plan only says what it would do.
+cmd_pr() {
+    local item_id="" draft=false title="" description="" target="" yes=0 plan=0 open=0 arg
+    local repo_spec branch wid item prefix existing summary body response id name
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --item)        item_id=${2:-}; shift ;;
+            --draft)       draft=true ;;
+            --title)       title=${2:-}; shift ;;
+            --description) description=${2:-}; shift ;;
+            --target)      target=${2:-}; shift ;;
+            --yes)         yes=1 ;;
+            --plan)        plan=1 ;;
+            --open)        open=1 ;;
+            *)             die "unknown argument $1 (ado --help)" ;;
+        esac
+        shift
+    done
+
+    repo_spec=$(repo_from_git) || { [ -n "$item_id" ] && repo_spec=$REPO; } \
+        || die "run this in a clone of an Azure DevOps repo, or give --item NUMBER"
+    load_repo "$repo_spec"
+    name=${repo_spec#*/}
+    if [ -n "$item_id" ]; then
+        [[ $item_id =~ ^[0-9]+$ ]] || die "--item needs a work item number"
+        branch=$(grep -E "(^|/)$item_id[-_]" <<< "$REPO_HEADS" | head -n 1)
+        [ -n "$branch" ] || die "work item $item_id has no branch in $repo_spec yet (ado start $item_id makes one)"
+    else
+        branch=$(git branch --show-current 2>/dev/null)
+        [ -n "$branch" ] || die "no branch: you are not on a branch in this folder"
+    fi
+    grep -qxF -- "$branch" <<< "$REPO_HEADS" || die "$branch is not on the server yet (git push -u origin $branch)"
+    target=${target:-$REPO_DEFAULT}
+    [ "$branch" != "$target" ] || die "$branch is the target branch itself"
+    existing=$(api "/$REPO_PATH/_apis/git/pullrequests?searchCriteria.repositoryId=$REPO_ID&searchCriteria.sourceRefName=refs/heads/$branch&searchCriteria.status=active&api-version=7.1" |
+        jq -r '.value[0].pullRequestId // empty')
+    [ -z "$existing" ] || die "$branch has pull request !$existing already"
+
+    # the work item in the branch name (feature/156438-title) gives the link and the title
+    wid=""
+    [[ $branch =~ (^|/)([0-9]+)[-_] ]] && wid=${BASH_REMATCH[2]}
+    if [ -z "$title" ]; then
+        prefix=""
+        [[ $branch == */* ]] && prefix="${branch%%/*}" && prefix="${prefix^^} "
+        if [ -n "$wid" ] && item=$(api "/_apis/wit/workitems/$wid?api-version=7.1" 2>/dev/null); then
+            title="$prefix[$wid] $(jq -r '.fields["System.Title"]' <<< "$item")"
+        else
+            wid=""
+            title="$prefix$(sed -E 's/[-_]+/ /g' <<< "${branch##*/}")"
+        fi
+    fi
+
+    summary="$title  ($branch -> $target$([ "$draft" = true ] && echo ", draft"))"
+    if [ "$plan" = 1 ]; then
+        echo "$summary"
+        return
+    fi
+    confirm_cli "Create pull request: $summary?" "$yes" || { echo "not created"; return; }
+
+    body=$(jq -n --arg src "refs/heads/$branch" --arg tgt "refs/heads/$target" --arg title "$title" --arg description "$description" \
+                 --argjson draft "$draft" --arg wid "$wid" \
+        '{sourceRefName: $src, targetRefName: $tgt, title: $title, description: $description, isDraft: $draft}
+         + (if $wid != "" then {workItemRefs: [{id: $wid}]} else {} end)')
+    response=$(api_send POST "/$REPO_PATH/_apis/git/repositories/$REPO_ID/pullrequests?api-version=7.1" "$body") || exit 1
+    id=$(jq -r '.pullRequestId // "?"' <<< "$response")
+    echo "created !$id  $title"
+    [ "$id" != "?" ] || return 0
+    echo "https://dev.azure.com/$ORG/$REPO_PATH/_git/$name/pullrequest/$id"
+    [ "$open" = 1 ] && open_url "https://dev.azure.com/$ORG/$REPO_PATH/_git/$name/pullrequest/$id"
+    return 0
+}
+
+# record_undo DESCRIPTION ARGS...: remember how to take back what was just done; ARGS are the arguments of ado that
+# do it. Only the last change is kept, for UNDO_MINUTES. Nothing for a dry run, nor for an undo itself.
+record_undo() {
+    if [ "${ADO_DRY_RUN:-}" = 1 ] || [ -n "${ADO_NO_UNDO:-}" ]; then
+        return 0
+    fi
+    local desc=$1
+    shift
+    mkdir -p "$STATE_DIR"
+    jq -n --arg desc "$desc" --argjson at "$(date +%s)" --argjson cmd "$(printf '%s\n' "$@" | jq -R . | jq -sc .)" \
+        '{at: $at, desc: $desc, cmd: $cmd}' > "$UNDO"
+}
+
+# undo_info: what can be undone, with how long ago ("approved !32332 (3m ago)"); fails when there is nothing
+undo_info() {
+    [ -r "$UNDO" ] || return 1
+    jq -er --argjson now "$(date +%s)" --argjson limit "$((UNDO_MINUTES * 60))" \
+        'select($now - .at <= $limit) | "\(.desc) (\(($now - .at) / 60 | floor)m ago)"' "$UNDO" 2>/dev/null
+}
+
+# cmd_undo [--yes] [--print]: take back the last vote, state change or auto-complete (--print: only say what it is)
+cmd_undo() {
+    local yes=0 info args
+    case ${1:-} in
+        --yes)   yes=1 ;;
+        --print) undo_info || echo "nothing to undo"; return ;;
+    esac
+    info=$(undo_info) || die "nothing to undo (there is no recent change, or it is older than $UNDO_MINUTES minutes)"
+    confirm_cli "Undo: $info?" "$yes" || { echo "not undone"; return; }
+    mapfile -t args < <(jq -r '.cmd[]' "$UNDO")
+    ADO_NO_UNDO=1 "$SELF" "${args[@]}" && rm -f "$UNDO"
 }
 
 # --- start work ---------------------------------------------------------------------------------------
@@ -832,8 +1071,8 @@ find_clone() {
 # (not when it is in one of them already), and open a terminal on the branch in a clone of the repo.
 # --plan only says what it would do.
 cmd_start() {
-    local id="" yes=0 plan=0 terminal=1 arg item type title current project repo_spec repo_project repo_name
-    local info repo_id heads existing name states target="" state want summary clone out
+    local id="" yes=0 plan=0 terminal=1 arg item type title current project repo_spec
+    local heads existing name states target="" state want summary clone out
     for arg in "$@"; do
         case $arg in
             --yes)         yes=1 ;;
@@ -853,13 +1092,8 @@ cmd_start() {
 
     # the repo: the clone you are in, else the one in the config (as ado branch does)
     repo_spec=$(repo_from_git) || repo_spec=$REPO
-    repo_project=${repo_spec%%/*}
-    repo_name=${repo_spec#*/}
-    info=$(api "/$(project_path "$repo_project")/_apis/git/repositories/$repo_name?api-version=7.1" 2>/dev/null) \
-        || die "there is no repo $repo_spec (or no access to it)"
-    repo_id=$(jq -r .id <<< "$info")
-    heads=$(api "/$(project_path "$repo_project")/_apis/git/repositories/$repo_id/refs?filter=heads/&\$top=1000&api-version=7.1" |
-        jq -r '.value[].name | sub("^refs/heads/"; "")') || die "could not list the branches of $repo_spec"
+    load_repo "$repo_spec"
+    heads=$REPO_HEADS
     existing=$(grep -E "(^|/)$id[-_]" <<< "$heads" | head -n 1)
     if [ -n "$existing" ]; then
         name=$existing
@@ -918,7 +1152,7 @@ item_entries() {
 # runs, your own PRs, then your work items. With items: only your work items.
 # The search entry has the url ado:search; cmd_menu answers it by asking what to search for.
 menu_entries() {
-    local prs failed items
+    local prs failed items info
     items=$(work_items | item_entries)
     if [ "$1" = items ]; then
         echo "$items"
@@ -929,6 +1163,7 @@ menu_entries() {
     failed=$(annotate_runs "$failed" "$prs")
     {
         printf 'ado:search\t? search work items...\tsearch\t\n'
+        if info=$(undo_info); then printf 'ado:undo\t<< undo: %s\tundo\t\n' "$info"; fi
         jq -r 'select(.waiting) | "\(.url)\t* review  !\(.id)  \(.title)  (\(.author))\(if (.via | length) > 0 then "  via " + (.via | join(", ")) else "" end)\tpr\t\(.id)"' <<< "$prs"
         jq -r 'select(.attention) | "\(.url)\t! failed  \(.name)  \(.branch)  #\(.number)\trun\t\(.id)"' <<< "$failed"
         jq -r 'select(.mine) | "\(.url)\t  my PR   !\(.id)  \(.title)\tpr-mine\t\(.id)"' <<< "$prs"
@@ -954,7 +1189,7 @@ reorder_recent() {
     awk -F'\t' -v OFS='\t' '
         NR == FNR { rank[$1 FS $2] = NR; next }
         { key = $3 FS $4
-          if ($3 == "search") group = 0; else if (key in rank) group = 1; else group = 2
+          if ($3 == "search" || $3 == "undo") group = 0; else if (key in rank) group = 1; else group = 2
           print group, (group == 1 ? -rank[key] : 0), FNR, $0 }' "$RECENT" - <<< "$1" |
         sort -t$'\t' -k1,1n -k2,2n -k3,3n | cut -f4-
 }
@@ -1006,7 +1241,22 @@ show_comments() {
     [ -n "$threads" ] || { say "ado" "no open comments on !$id"; return; }
     list=$(paste -d $'\t' <(jq -r --arg url "$url" '"\($url)?discussionId=\(.id)"' <<< "$threads") <(thread_line <<< "$threads"))
     choice=$(cut -f2 <<< "$list" | fuzzel --dmenu --index --prompt "!$id comments> " --width 120 --lines 12) || return 0
-    open_url "$(sed -n "$((choice + 1))p" <<< "$list" | cut -f1)"
+    thread_actions "$id" "$url" "$(sed -n "$((choice + 1))p" <<< "$threads")"
+}
+
+# thread_actions NUMBER URL THREAD: what to do with one comment thread (THREAD is its JSON from pr_threads)
+thread_actions() {
+    local id=$1 url=$2 thread=$3 tid choice text
+    tid=$(jq -r .id <<< "$thread")
+    choice=$(printf '%s\n' "Open" "Reply" "Resolve" "Close as won't fix" "Copy text" | pick_menu "thread #$tid") || return 0
+    case $choice in
+        0) open_url "$url?discussionId=$tid" ;;
+        1) text=$(fuzzel --dmenu --lines 0 --prompt "reply to #$tid> " --width 100 < /dev/null) || return 0
+           [ -n "$text" ] && confirm_menu "Post this reply on #$tid: ${text:0:60}?" && run_action reply "$id" "$tid" "$text" ;;
+        2) confirm_menu "Resolve thread #$tid?" && run_action resolve "$id" "$tid" ;;
+        3) confirm_menu "Close thread #$tid as won't fix?" && run_action resolve "$id" "$tid" --wontfix ;;
+        4) jq -r .text <<< "$thread" | wl-copy; say "ado" "comment copied" ;;
+    esac
 }
 
 # menu_actions KIND REF URL: what you can do with the entry you picked (Open comes first)
@@ -1015,12 +1265,12 @@ menu_actions() {
     case $kind in
         pr)      labels+=("Approve" "Approve with suggestions" "Wait for the author" "Reject" "Reset my vote" "Show open comments" "Copy link" "Copy checkout command")
                  keys+=(vote-approve vote-suggest vote-wait vote-reject vote-reset comments link checkout) ;;
-        pr-mine) labels+=("Show open comments" "Copy link" "Copy checkout command")
-                 keys+=(comments link checkout) ;;
+        pr-mine) labels+=("Show open comments" "Set auto-complete" "Cancel auto-complete" "Copy link" "Copy checkout command")
+                 keys+=(comments complete uncomplete link checkout) ;;
         run)     labels+=("Run it again" "Copy link")
                  keys+=(rerun link) ;;
-        item)    labels+=("Start work" "Create a branch" "Change state" "Copy number" "Copy link")
-                 keys+=(start branch state number link) ;;
+        item)    labels+=("Start work" "Create pull request" "Create a branch" "Change state" "Copy number" "Copy link")
+                 keys+=(start newpr branch state number link) ;;
         *)       open_url "$url"; return ;;
     esac
     choice=$(printf '%s\n' "${labels[@]}" | pick_menu "actions") || return 0
@@ -1033,6 +1283,11 @@ menu_actions() {
         comments) show_comments "$ref" "$url" ;;
         vote-*)   confirm_menu "${labels[$choice]} !$ref?" && run_action vote "$ref" "${key#vote-}" --yes ;;
         rerun)    confirm_menu "Run it again?" && run_action rerun "$ref" --yes ;;
+        complete)   confirm_menu "Complete !$ref by itself when it may (squash, delete the branch)?" && run_action complete "$ref" --yes ;;
+        uncomplete) confirm_menu "Cancel auto-complete of !$ref?" && run_action complete "$ref" --cancel --yes ;;
+        newpr)
+            plan=$("$SELF" pr --item "$ref" --plan 2>&1) || { say -u critical "ado: no pull request" "$plan"; return; }
+            confirm_menu "Create pull request: $plan?" && run_action pr --item "$ref" --yes --open ;;
         start)
             plan=$("$SELF" start "$ref" --plan 2>&1) || { say -u critical "ado: cannot start" "$plan"; return; }
             confirm_menu "Start work on $ref: $plan?" && run_action start "$ref" --yes ;;
@@ -1096,6 +1351,10 @@ cmd_menu() {
     IFS=$'\t' read -r url _ kind ref <<< "$(sed -n "$((choice + 1))p" <<< "$entries")"
     [ "$url" = about:blank ] && exit 0
     [ "$kind" = search ] && exec "$SELF" menu search
+    if [ "$kind" = undo ]; then
+        confirm_menu "Undo: $(undo_info)?" && run_action undo --yes
+        exit 0
+    fi
     record_recent "$kind" "$ref"
     if [ "$status" = 10 ]; then
         open_url "$url"
@@ -1211,13 +1470,18 @@ command=${1:-}
 
 case $command in
     ""|-h|--help|help) usage; exit 0 ;;
-    prs|runs|items|item|branch|start|vote|comments|checkout|rerun|state|menu|refresh|status) ;;
+    prs|runs|items|item|branch|start|pr|vote|comments|reply|resolve|complete|checkout|rerun|state|undo|menu|refresh|status) ;;
     *) die "unknown command '$command' (ado --help)" ;;
 esac
 
 load_config
 case $command in
     start)    cmd_start "$@" ;;
+    pr)       cmd_pr "$@" ;;
+    reply)    cmd_reply "$@" ;;
+    resolve)  cmd_resolve "$@" ;;
+    complete) cmd_complete "$@" ;;
+    undo)     cmd_undo "$@" ;;
     vote)     cmd_vote "$@" ;;
     comments) cmd_comments "$@" ;;
     checkout) cmd_checkout "$@" ;;
