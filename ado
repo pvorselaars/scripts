@@ -42,6 +42,8 @@
 #                            your failed runs (--yes skips the question)
 #   ado attach FILE          put a file (a screenshot, a GIF of a bug) on a work item (--item ID) or a pull request
 #                            (--pr NUMBER), with the picture in a comment, after --text if you give it (--yes, --plan)
+#   ado clone                the folder of your clone of the repo of the config (the folder you are in, CLONE, or one
+#                            in ~/Projects); fails when there is none
 #   ado undo                 take back the last vote, state change or auto-complete (for 30 minutes)
 #
 # Menu and background
@@ -1410,6 +1412,12 @@ cmd_rerun() {
 }
 
 
+# cmd_clone: print the folder of your clone of the repo (see find_clone), or fail when there is none
+cmd_clone() {
+    choose_repo
+    find_clone "$REPO_SPEC" || exit 1
+}
+
 # cmd_attach FILE (--item ID | --pr NUMBER) [--text TEXT] [--yes] [--plan]: put a file (a screenshot, a GIF of a bug) on
 # a work item or a pull request, with the picture itself in a comment, after the text if there is one. The last line it
 # prints is the page of the work item or the pull request. --plan only says what it would do.
@@ -1985,7 +1993,7 @@ if [ $# -gt 0 ]; then shift; fi
 
 case $command in
     ""|-h|--help|help) usage; exit 0 ;;
-    prs|runs|items|item|branch|sprint|new|start|pr|vote|comments|reply|resolve|complete|checkout|rerun|state|undo|menu|refresh|notify|attach|status) ;;
+    prs|runs|items|item|branch|sprint|new|start|pr|vote|comments|reply|resolve|complete|checkout|rerun|state|undo|menu|refresh|notify|attach|clone|status) ;;
     *) die "unknown command '$command' (ado --help)" ;;
 esac
 
@@ -1993,6 +2001,7 @@ load_config
 case $command in
     notify)   cmd_notify "$@" ;;
     attach)   cmd_attach "$@" ;;
+    clone)    cmd_clone ;;
     sprint)   cmd_sprint "$@" ;;
     new)      cmd_new "$@" ;;
     start)    cmd_start "$@" ;;
