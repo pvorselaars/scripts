@@ -11,9 +11,30 @@
 #   ado branch [ID] [options] create a branch for a work item, e.g. feature/156438-short-title (see below)
 #                            Without an ID, item and branch let you pick one of your work items with fzf
 #                            (with a preview of the item; --all: every one that is not closed).
-#   ado menu [items]         pick a pull request or a failed run (or, with items, a work item) in fuzzel
-#                            and open it in Firefox
-#   ado refresh              look everything up and store the counts for the status bar
+#   ado start [ID]           start work on a work item: create its branch (linked), move it to In Progress (or
+#                            Committed) and open a terminal on the branch in your clone (--plan: only say what
+#                            it would do, --yes, --no-terminal)
+#   ado vote NUMBER WORD     vote on a pull request: approve, suggest (approve with suggestions), wait (for the
+#                            author), reject or reset; asks first (--yes skips the question)
+#   ado comments [NUMBER]    the open comment threads of a pull request; without a number, of your own PRs
+#   ado checkout NUMBER      switch the clone you are in to the branch of a pull request (--print: only show
+#                            the git commands)
+#   ado rerun [RUN_ID]       queue a run of a pipeline again on the same branch; without an id, pick one of
+#                            your failed runs (--yes skips the question)
+#   ado state [ID] [STATE]   move a work item to another state, e.g. Done; without them, pick (--yes, --list)
+#   ado menu [items]         pick a pull request, a failed run or one of your work items (with items: only
+#                            the work items) in fuzzel. Enter shows what you can do with it: open it in
+#                            Firefox, vote, show the open comments, copy the link or the checkout command,
+#                            run it again, start work, create a branch, change the state. Alt+1 opens it at
+#                            once. The first entry searches all work items; the last five things you picked
+#                            come right after it.
+#   ado menu search [WORDS]  search the titles of all work items (not only yours) for WORDS, or for what you
+#                            type in fuzzel; pick one to open it. A number (156438 or #156438) opens that
+#                            work item directly.
+#   ado refresh              look everything up and store the counts for the status bar (a timer does this every
+#                            five minutes), and send a notification for what is new since the last time: a
+#                            review that is asked, a failed run, a vote or a comment on a pull request of yours,
+#                            and a review or pull request that has been waiting too long (once each)
 #   ado status               print the stored counts: REVIEW FAILED (or "login" when az needs a new sign-in)
 #
 # ado branch ID [--repo PROJECT/REPO] [--from BRANCH] [--name NAME] [--prefix PREFIX] [--link] [--checkout]
@@ -29,15 +50,23 @@
 #   PROJECTS=QuestifyBuilder Another_Project     projects with the repos (_ stands for a space in a name)
 #   REPO=QuestifyBuilder/Construction.Platform   where ado branch works when you are not in a clone
 #   IGNORE_GROUPS=Testers                        words in team names that must not make a PR wait for you
-#   ITEM_STATES=Committed In Progress To Do      the states that mean a work item is being worked on
+#   ITEM_STATES=Committed|In Progress|To Do      the states that mean a work item is being worked on (| between them)
+#   START_STATES=In Progress|Committed           where ado start moves a work item to: the first of these its type has
+#   CLONE=~/Projects/x/repo                      the clone ado start opens a terminal in (else the folder you are in,
+#                                                or a clone of the repo found in ~/Projects)
+#   NOTIFY=1                                     0: ado refresh does not send notifications
+#   NUDGE_REVIEW_HOURS=24                        a review that waits this long turns the status bar count red
+#   NUDGE_PR_DAYS=2                              a pull request of yours without any vote for this long is noted
 # `az login` has to be recent: your organisation asks for a new sign-in every 24 hours.
-# `ado menu --print` lists the entries without the menu.
+# `ado menu --print` lists the entries without the menu (--raw: with their url, kind and number).
+# ADO_DRY_RUN=1 makes vote, rerun, state and branch print what they would send, and change nothing.
 
 CONFIG=${ADO_CONFIG:-$HOME/.config/ado/config}
 CACHE=${XDG_RUNTIME_DIR:-/tmp}/ado
 API=${ADO_API:-https://dev.azure.com}
 VSSPS=${ADO_VSSPS:-https://vssps.dev.azure.com}
 RESOURCE=499b84ac-1321-427f-aa17-267ca6975798     # the Azure DevOps resource: what az needs to know
+SELF=$(readlink -f "$0")                          # this script, for the preview of fzf and the menu actions
 
 die() { echo "ado: $*" >&2; exit 1; }
 
@@ -52,14 +81,20 @@ load_config() {
     PROJECTS=QuestifyBuilder
     REPO=QuestifyBuilder/Construction.Platform
     IGNORE_GROUPS=""
-    ITEM_STATES="Committed In Progress To Do"
+    ITEM_STATES="Committed|In Progress|To Do"
+    START_STATES="In Progress|Committed"
+    CLONE=""
+    NOTIFY=1
+    NUDGE_REVIEW_HOURS=24
+    NUDGE_PR_DAYS=2
     if [ -r "$CONFIG" ]; then
-        for name in ORG PROJECTS REPO IGNORE_GROUPS ITEM_STATES; do
+        for name in ORG PROJECTS REPO IGNORE_GROUPS ITEM_STATES START_STATES CLONE NOTIFY NUDGE_REVIEW_HOURS NUDGE_PR_DAYS; do
             value=$(sed -n "s/^$name=//p" "$CONFIG" | head -n 1)
             [ -n "$value" ] && printf -v "$name" '%s' "$value"
         done
     fi
     [ -n "$ORG" ] && [ -n "$PROJECTS" ] || die "ORG and PROJECTS must be set in $CONFIG"
+    CLONE=${CLONE/#\~/$HOME}
 }
 
 # a project name as it is written in the config ("_" for a space) and as it goes into a URL
@@ -103,9 +138,15 @@ vssps() {
     curl -fsS -H "Authorization: Bearer $token" "$VSSPS/$ORG$1"
 }
 
-# api_send METHOD PATH JSON [CONTENT_TYPE]: send JSON to Azure DevOps; on an error print its message and fail
+# api_send METHOD PATH JSON [CONTENT_TYPE]: send JSON to Azure DevOps; on an error print its message and fail.
+# With ADO_DRY_RUN=1 nothing is changed: what would be sent is printed (queries still go out, they only read).
 api_send() {
     local method=$1 path=$2 body=$3 type=${4:-application/json} token response status
+    if [ "${ADO_DRY_RUN:-}" = 1 ] && [[ $path != */wiql* ]]; then
+        echo "ado (dry run): $method $path $body" >&2
+        echo '{"dryRun": true, "value": [{"success": true}]}'
+        return 0
+    fi
     token=$(token) || return 1
     response=$(curl -sS -X "$method" -H "Authorization: Bearer $token" -H "Content-Type: $type" -d "$body" \
         -w $'\n%{http_code}' "$API/$ORG$path") || { echo "ado: could not reach Azure DevOps" >&2; return 1; }
@@ -152,7 +193,9 @@ my_groups() {
 # --- pull requests and runs -----------------------------------------------------------------------
 
 # pull_requests: one JSON object per active pull request that is yours or waits for you, over all projects:
-#   {project, repo, id, title, author, created, draft, mine, waiting, via, url}
+#   {project, path, repo, repo_id, branch, id, title, author, created, draft, mine, votes, waiting, via, url}
+# (votes: the reviewers that have voted, as {name, vote})
+# (path is the project as it goes into a URL)
 # A PR waits for you when it is not a draft and not yours, you have not voted, and either you are a
 # reviewer or a team you are in is a required reviewer that has not voted yet (via lists those teams).
 # A team votes when one of its members votes for it, so a team with a vote of 0 still needs someone.
@@ -177,13 +220,17 @@ pull_requests() {
                    | .displayName | team_name] as $via
                 | {
                     project: $project,
+                    path: $path,
                     repo: .repository.name,
+                    repo_id: .repository.id,
+                    branch: (.sourceRefName | sub("^refs/heads/"; "")),
                     id: .pullRequestId,
                     title,
                     author: .createdBy.displayName,
                     created: .creationDate,
                     draft: (.isDraft // false),
                     mine: (.createdBy.id == $me),
+                    votes: [($pr.reviewers // [])[] | select(.vote != 0) | {name: .displayName, vote}],
                     via: $via,
                     waiting: ((.isDraft // false | not) and (.createdBy.id != $me)
                               and ($my_entry == null or $my_entry.vote == 0)
@@ -195,7 +242,7 @@ pull_requests() {
 }
 
 # runs: one JSON object per recent pipeline run of yours, over all projects:
-#   {project, id, name, number, branch, result, status, finished, url, stale}
+#   {project, id, definition, name, number, branch, result, status, finished, url, stale}
 # `stale` is false for the newest run of a pipeline on a branch only, so a failure that a later
 # run has fixed does not count.
 runs() {
@@ -208,6 +255,7 @@ runs() {
                 .value | to_entries | map(.value + {order: .key}) | .[] | {
                     project: $project,
                     id,
+                    definition: .definition.id,
                     name: .definition.name,
                     number: .buildNumber,
                     branch: (.sourceBranch | sub("^refs/heads/"; "")),
@@ -258,15 +306,35 @@ html_to_text() {
 # The work items can be in another project than the code (here: Cito, while the repos are in QuestifyBuilder),
 # so the query is not limited to one project.
 work_items() {
-    local where state query ids list=""
+    local where state states query ids list=""
     if [ "$1" = --all ]; then
         where="[System.State] NOT IN ('Done','Removed','Closed','Resolved')"
     else
-        for state in $ITEM_STATES; do list+="'$state',"; done
+        IFS='|' read -ra states <<< "$ITEM_STATES"
+        for state in "${states[@]}"; do list+="'$state',"; done
         where="[System.State] IN (${list%,})"
     fi
     query=$(jq -n --arg q "SELECT [System.Id] FROM WorkItems WHERE [System.AssignedTo] = @Me AND $where ORDER BY [System.ChangedDate] DESC" '{query: $q}')
     ids=$(api_send POST '/_apis/wit/wiql?$top=50&api-version=7.1' "$query" | jq -r '[.workItems[].id] | join(",")') || return 1
+    items_from_ids "$ids"
+}
+
+# search_items TEXT: like work_items, but for any work item whose title contains all the words of TEXT
+# (not only yours, in any state), the most recently changed first
+search_items() {
+    local word where="" query ids
+    for word in $1; do
+        where+=" AND [System.Title] CONTAINS '${word//\'/\'\'}'"
+    done
+    [ -n "$where" ] || return 0
+    query=$(jq -n --arg q "SELECT [System.Id] FROM WorkItems WHERE [System.Id] > 0$where ORDER BY [System.ChangedDate] DESC" '{query: $q}')
+    ids=$(api_send POST '/_apis/wit/wiql?$top=50&api-version=7.1' "$query" | jq -r '[.workItems[].id] | join(",")') || return 1
+    items_from_ids "$ids"
+}
+
+# items_from_ids IDS: the work_items JSON objects for comma separated work item numbers, in that order
+items_from_ids() {
+    local ids=$1
     [ -n "$ids" ] || return 0
 
     api "/_apis/wit/workitems?ids=$ids&fields=System.Id,System.WorkItemType,System.State,System.Title,System.TeamProject,System.IterationPath&api-version=7.1" |
@@ -285,10 +353,10 @@ work_items() {
 
 # --- branches -------------------------------------------------------------------------------------
 
-# repo_from_git: "PROJECT/REPO" of the Azure DevOps clone in the current folder (fails when there is none)
+# repo_from_git [DIR]: "PROJECT/REPO" of the Azure DevOps clone in DIR, or in the current folder (fails when there is none)
 repo_from_git() {
     local url rest project
-    url=$(git remote get-url origin 2>/dev/null) || return 1
+    url=$(git -C "${1:-.}" remote get-url origin 2>/dev/null) || return 1
     case $url in
         *ssh.dev.azure.com:v3/*)        # git@ssh.dev.azure.com:v3/ORG/PROJECT/REPO
             rest=${url#*:v3/}
@@ -317,14 +385,12 @@ branch_slug() {
     echo "${slug:0:50}" | sed -E 's/-+$//'
 }
 
-# pick_item [--all]: choose one of your work items and print its number. fzf shows a preview of the item next
-# to the list; without fzf or without a terminal it is a numbered list. ADO_PICKER=list forces the list and
-# ADO_PICKER=fzf forces fzf. Status: 0 picked, 3 nothing picked, 1 an error.
-pick_item() {
-    local list choice n self status use_fzf=0
-    list=$(work_items "$1" | jq -r '"\(.id)\t\(.type | sub("Product Backlog Item"; "PBI"))  \(.state)  \(.iteration)  \(.title)"') || return 1
-    [ -n "$list" ] || { echo "ado: no work items assigned to you in these states (--all shows more)" >&2; return 1; }
-
+# pick_from PROMPT LIST [PREVIEW_ARGS]: choose one line of LIST ("key TAB label" lines) and print its key. fzf shows
+# the labels, and with PREVIEW_ARGS (the arguments of ado, the key is added) a preview next to them; without fzf or
+# without a terminal it is a numbered list. ADO_PICKER=list forces the list and ADO_PICKER=fzf forces fzf.
+# Status: 0 picked, 3 nothing picked.
+pick_from() {
+    local prompt=$1 list=$2 preview=${3:-} choice n use_fzf=0 args=()
     # fzf when it is installed and there is a terminal for it, unless ADO_PICKER says otherwise
     case ${ADO_PICKER:-auto} in
         fzf)  use_fzf=1 ;;
@@ -334,11 +400,8 @@ pick_item() {
     command -v fzf >/dev/null || use_fzf=0
 
     if [ "$use_fzf" = 1 ]; then
-        self=$(readlink -f "$0")
-        choice=$(fzf --delimiter '\t' --with-nth 2 --prompt 'work item> ' \
-            --preview "'$self' item {1}" --preview-window 'right,55%,wrap' <<< "$list")
-        status=$?
-        [ "$status" -eq 0 ] || return 3
+        [ -n "$preview" ] && args=(--preview "'$SELF' $preview {1}" --preview-window 'right,55%,wrap')
+        choice=$(fzf --delimiter '\t' --with-nth 2 --prompt "$prompt> " "${args[@]}" <<< "$list") || return 3
     else
         cut -f2 <<< "$list" | nl -w2 -s'. ' >&2
         read -r -p "Number: " n
@@ -347,6 +410,14 @@ pick_item() {
     fi
     [ -n "$choice" ] || return 3
     echo "${choice%%$'\t'*}"
+}
+
+# pick_item [--all]: choose one of your work items and print its number. Status: 0 picked, 3 nothing picked, 1 an error.
+pick_item() {
+    local list
+    list=$(work_items "$1" | jq -r '"\(.id)\t\(.type | sub("Product Backlog Item"; "PBI"))  \(.state)  \(.iteration)  \(.title)"') || return 1
+    [ -n "$list" ] || { echo "ado: no work items assigned to you in these states (--all shows more)" >&2; return 1; }
+    pick_from 'work item' "$list" item
 }
 
 # resolve_item ID ALL: the work item number that was given, or else one picked from your work items.
@@ -361,6 +432,14 @@ resolve_item() {
     fi
     [[ $id =~ ^[0-9]+$ ]] || { echo "ado: a work item number is needed" >&2; return 1; }
     echo "$id"
+}
+
+# confirm_cli QUESTION YES: unless YES is 1, ask on the terminal; status 0 when it may go ahead
+confirm_cli() {
+    local answer
+    [ "$2" = 1 ] && return 0
+    read -r -p "$1 [y/N] " answer
+    [[ $answer == [yY]* ]]
 }
 
 # --- commands--------------------------------------------------------------------------------------
@@ -463,7 +542,7 @@ cmd_branch() {
     id=$(resolve_item "$id" "$all"); case $? in 0) ;; 3) exit 0 ;; *) exit 1 ;; esac
 
     local item type title where repo_spec project repo_name info repo_id project_id default_branch
-    local base base_sha heads clash answer body response name_given=0
+    local base base_sha heads clash body response name_given=0
     [ -n "$name" ] && name_given=1
 
     item=$(api "/_apis/wit/workitems/$id?api-version=7.1") || exit 1
@@ -513,10 +592,7 @@ cmd_branch() {
     printf 'from        %s  (%s)\n' "$base" "${base_sha:0:8}"
     printf 'new branch  %s%s\n' "$name" "$([ "$link" = 1 ] && echo '   (and linked to the work item)')"
     [ "$dry" = 1 ] && exit 0
-    if [ "$yes" != 1 ]; then
-        read -r -p "Create it? [y/N] " answer
-        [[ $answer == [yY]* ]] || { echo "not created"; exit 0; }
-    fi
+    confirm_cli "Create it?" "$yes" || { echo "not created"; exit 0; }
 
     body=$(jq -n --arg name "refs/heads/$name" --arg sha "$base_sha" \
         '[{name: $name, oldObjectId: "0000000000000000000000000000000000000000", newObjectId: $sha}]')
@@ -546,54 +622,577 @@ cmd_branch() {
     fi
 }
 
-# menu_entries [items]: "url TAB label" lines for the picker. Without items: waiting PRs first, then the
-# failed runs, then your own PRs. With items: your work items.
+# --- pull requests: votes, comments, checkout; builds; work item state ------------------------------
+
+# pr_json NUMBER: the pull request, found by its number alone (they are numbered over the whole organisation)
+pr_json() { api "/_apis/git/pullrequests/$1?api-version=7.1"; }
+
+# pr_threads PROJECT REPO NUMBER: one JSON object per comment thread of a pull request that is still open:
+#   {id, status, file, line, author, text, replies}      (PROJECT and REPO as they go into a URL: names or ids)
+pr_threads() {
+    api "/$1/_apis/git/repositories/$2/pullRequests/$3/threads?api-version=7.1" | jq -c '
+        .value[]
+        | select((.status == "active" or .status == "pending") and (.isDeleted | not)
+                 and ((.comments[0].commentType // "text") != "system"))
+        | {id, status, file: .threadContext.filePath,
+           line: (.threadContext.rightFileStart.line // .threadContext.leftFileStart.line),
+           author: .comments[0].author.displayName, text: (.comments[0].content // ""),
+           replies: ((.comments | length) - 1)}'
+}
+
+# thread_line: from threads (JSON lines) on stdin, one text line each: file:line, who, what, replies
+thread_line() {
+    jq -r '"\(.file // "(general)")\(if .line then ":\(.line)" else "" end)  \(.author): \(.text | gsub("\\s+"; " ") | .[0:90])\(if .replies > 0 then "  (+\(.replies))" else "" end)"'
+}
+
+# vote_value WORD: the number Azure DevOps keeps for a vote (fails for an unknown word)
+vote_value() {
+    case $1 in
+        approve) echo 10 ;;
+        suggest) echo 5 ;;
+        wait)    echo -5 ;;
+        reject)  echo -10 ;;
+        reset)   echo 0 ;;
+        *)       return 1 ;;
+    esac
+}
+
+vote_text() {
+    case $1 in
+        approve) echo "approved" ;;
+        suggest) echo "approved with suggestions" ;;
+        wait)    echo "waiting for the author" ;;
+        reject)  echo "rejected" ;;
+        reset)   echo "vote reset" ;;
+    esac
+}
+
+cmd_vote() {
+    local id="" word="" yes=0 arg value pr title me
+    for arg in "$@"; do
+        case $arg in
+            --yes) yes=1 ;;
+            -*)    die "unknown option $arg (ado --help)" ;;
+            *)     if [ -z "$id" ]; then id=${arg#!}; else word=$arg; fi ;;
+        esac
+    done
+    [[ $id =~ ^[0-9]+$ ]] && [ -n "$word" ] || die "usage: ado vote NUMBER approve|suggest|wait|reject|reset [--yes]"
+    value=$(vote_value "$word") || die "unknown vote '$word' (approve, suggest, wait, reject or reset)"
+    pr=$(pr_json "$id") || die "there is no pull request $id (or no access to it)"
+    title=$(jq -r .title <<< "$pr")
+    confirm_cli "Vote '$word' on !$id  $title?" "$yes" || { echo "not voted"; return; }
+    me=$(my_id) || exit 1
+    api_send PUT "/$(jq -r .repository.project.id <<< "$pr")/_apis/git/repositories/$(jq -r .repository.id <<< "$pr")/pullrequests/$id/reviewers/$me?api-version=7.1" \
+        "$(jq -n --argjson vote "$value" '{vote: $vote}')" >/dev/null || exit 1
+    echo "$(vote_text "$word"): !$id  $title"
+}
+
+# cmd_comments [NUMBER]: the open comment threads of a pull request; without a number, of all your own pull requests
+cmd_comments() {
+    local id=${1#!} pr line threads
+    if [ -n "$id" ]; then
+        [[ $id =~ ^[0-9]+$ ]] || die "a pull request number is needed"
+        pr=$(pr_json "$id") || die "there is no pull request $id (or no access to it)"
+        threads=$(pr_threads "$(jq -r .repository.project.id <<< "$pr")" "$(jq -r .repository.id <<< "$pr")" "$id") || exit 1
+        [ -n "$threads" ] || { echo "no open comments on !$id"; return; }
+        thread_line <<< "$threads"
+        return
+    fi
+    local any=0
+    while IFS= read -r line; do
+        threads=$(pr_threads "$(jq -r .path <<< "$line")" "$(jq -r .repo_id <<< "$line")" "$(jq -r .id <<< "$line")") || exit 1
+        [ -n "$threads" ] || continue
+        any=1
+        echo "!$(jq -r .id <<< "$line")  $(jq -r .title <<< "$line")"
+        thread_line <<< "$threads" | sed 's/^/  /'
+    done < <(pull_requests | jq -c 'select(.mine)')
+    [ "$any" = 1 ] || echo "no open comments on your pull requests"
+}
+
+# cmd_checkout NUMBER [--print]: switch the clone you are in to the branch of a pull request
+# (--print: only show the commands, for a clone you are not in)
+cmd_checkout() {
+    local id="" print=0 arg pr repo branch
+    for arg in "$@"; do
+        case $arg in
+            --print) print=1 ;;
+            -*)      die "unknown option $arg (ado --help)" ;;
+            *)       id=${arg#!} ;;
+        esac
+    done
+    [[ $id =~ ^[0-9]+$ ]] || die "usage: ado checkout NUMBER [--print]"
+    pr=$(pr_json "$id") || die "there is no pull request $id (or no access to it)"
+    repo=$(jq -r '"\(.repository.project.name)/\(.repository.name)"' <<< "$pr")
+    branch=$(jq -r '.sourceRefName | sub("^refs/heads/"; "")' <<< "$pr")
+    if [ "$print" = 1 ]; then
+        echo "git fetch origin $branch && git switch $branch"
+        return
+    fi
+    [ "$(repo_from_git)" = "$repo" ] || die "this folder is not a clone of $repo"
+    git fetch origin "$branch" || exit 1
+    if git show-ref --verify --quiet "refs/heads/$branch"; then
+        git switch "$branch"
+    else
+        git switch --track -c "$branch" "origin/$branch"
+    fi
+}
+
+# cmd_rerun [BUILD_ID] [--yes]: queue a run of the same pipeline on the same branch again; without an id, pick
+# one of your failed runs
+cmd_rerun() {
+    local id="" yes=0 arg list build project path name ref definition body response prs
+    for arg in "$@"; do
+        case $arg in
+            --yes) yes=1 ;;
+            -*)    die "unknown option $arg (ado --help)" ;;
+            *)     id=$arg ;;
+        esac
+    done
+    if [ -z "$id" ]; then
+        prs=$(pull_requests) || exit 1
+        list=$(annotate_runs "$(runs)" "$prs" | jq -r 'select(.attention) | "\(.id)\t\(.name)  \(.branch)  #\(.number)"') || exit 1
+        [ -n "$list" ] || die "none of your runs has failed"
+        id=$(pick_from 'failed run' "$list"); case $? in 0) ;; 3) exit 0 ;; *) exit 1 ;; esac
+    fi
+    [[ $id =~ ^[0-9]+$ ]] || die "a run number is needed (the id in the link of the run)"
+
+    build=""
+    for project in $PROJECTS; do
+        path=$(project_path "$project")
+        build=$(api "/$path/_apis/build/builds/$id?api-version=7.1" 2>/dev/null) && break
+        build=""
+    done
+    [ -n "$build" ] || die "there is no run $id in $PROJECTS"
+    name=$(jq -r .definition.name <<< "$build")
+    definition=$(jq -r .definition.id <<< "$build")
+    ref=$(jq -r .sourceBranch <<< "$build")
+    confirm_cli "Run $name again on ${ref#refs/heads/}?" "$yes" || { echo "not queued"; return; }
+
+    body=$(jq -n --argjson definition "$definition" --arg ref "$ref" '{definition: {id: $definition}, sourceBranch: $ref}')
+    response=$(api_send POST "/$path/_apis/build/builds?api-version=7.1" "$body") || exit 1
+    echo "queued $name #$(jq -r '.buildNumber // "?"' <<< "$response") on ${ref#refs/heads/}"
+}
+
+# cmd_state [NUMBER] [STATE] [--yes] [--list]: move a work item to another state, e.g. Done (the states are those
+# of its type; without a state, pick one). --list only prints the states it can go to.
+cmd_state() {
+    local id="" state="" yes=0 list=0 arg item type project title current states match body
+    for arg in "$@"; do
+        case $arg in
+            --yes)  yes=1 ;;
+            --list) list=1 ;;
+            -*)     die "unknown option $arg (ado --help)" ;;
+            *)      if [ -z "$id" ] && [[ $arg =~ ^[0-9]+$ ]]; then id=$arg; else state+="${state:+ }$arg"; fi ;;
+        esac
+    done
+    id=$(resolve_item "$id" ""); case $? in 0) ;; 3) exit 0 ;; *) exit 1 ;; esac
+    item=$(api "/_apis/wit/workitems/$id?api-version=7.1") || exit 1
+    type=$(jq -r '.fields["System.WorkItemType"]' <<< "$item")
+    project=$(jq -r '.fields["System.TeamProject"]' <<< "$item")
+    title=$(jq -r '.fields["System.Title"]' <<< "$item")
+    current=$(jq -r '.fields["System.State"]' <<< "$item")
+    states=$(api "/${project// /%20}/_apis/wit/workitemtypes/${type// /%20}/states?api-version=7.1" | jq -r '.value[].name') || exit 1
+
+    if [ "$list" = 1 ]; then
+        grep -vFx -- "$current" <<< "$states"
+        return
+    fi
+    if [ -z "$state" ]; then
+        state=$(pick_from "state of $id (now $current)" "$(grep -vFx -- "$current" <<< "$states" | awk '{print $0 "\t" $0}')")
+        case $? in 0) ;; 3) exit 0 ;; *) exit 1 ;; esac
+    fi
+    match=$(grep -ixF -- "$state" <<< "$states" | head -n 1)
+    [ -n "$match" ] || die "work item $id ($type) has no state '$state' (it has: $(paste -sd, <<< "$states" | sed 's/,/, /g'))"
+    [ "$match" != "$current" ] || { echo "work item $id is $current already"; return; }
+    confirm_cli "Move work item $id from $current to $match?  $title" "$yes" || { echo "not changed"; return; }
+
+    body=$(jq -n --arg state "$match" '[{op: "add", path: "/fields/System.State", value: $state}]')
+    api_send PATCH "/_apis/wit/workitems/$id?api-version=7.1" "$body" application/json-patch+json >/dev/null || exit 1
+    echo "work item $id: $current -> $match  $title"
+}
+
+# --- start work ---------------------------------------------------------------------------------------
+
+# find_clone REPO_SPEC: the folder of a clone of PROJECT/REPO: CLONE from the config, the folder you are in, or
+# a clone in ~/Projects (up to two levels down). Fails when there is none.
+find_clone() {
+    local dir
+    for dir in "$CLONE" "$PWD" "$HOME"/Projects/*/ "$HOME"/Projects/*/*/; do
+        [ -n "$dir" ] && [ -e "$dir/.git" ] || continue
+        if [ "$(repo_from_git "$dir")" = "$1" ]; then
+            echo "${dir%/}"
+            return
+        fi
+    done
+    return 1
+}
+
+# cmd_start [ID] [--yes] [--plan] [--no-terminal]: start work on a work item: make its branch (linked to the item, as
+# ado branch --link does; an existing branch of the item is used as it is), move the item to START_STATES
+# (not when it is in one of them already), and open a terminal on the branch in a clone of the repo.
+# --plan only says what it would do.
+cmd_start() {
+    local id="" yes=0 plan=0 terminal=1 arg item type title current project repo_spec repo_project repo_name
+    local info repo_id heads existing name states target="" state want summary clone out
+    for arg in "$@"; do
+        case $arg in
+            --yes)         yes=1 ;;
+            --plan)        plan=1 ;;
+            --no-terminal) terminal=0 ;;
+            -*)            die "unknown option $arg (ado --help)" ;;
+            *)             id=$arg ;;
+        esac
+    done
+    id=$(resolve_item "$id" ""); case $? in 0) ;; 3) exit 0 ;; *) exit 1 ;; esac
+
+    item=$(api "/_apis/wit/workitems/$id?api-version=7.1") || exit 1
+    type=$(jq -r '.fields["System.WorkItemType"]' <<< "$item")
+    title=$(jq -r '.fields["System.Title"]' <<< "$item")
+    current=$(jq -r '.fields["System.State"]' <<< "$item")
+    project=$(jq -r '.fields["System.TeamProject"]' <<< "$item")
+
+    # the repo: the clone you are in, else the one in the config (as ado branch does)
+    repo_spec=$(repo_from_git) || repo_spec=$REPO
+    repo_project=${repo_spec%%/*}
+    repo_name=${repo_spec#*/}
+    info=$(api "/$(project_path "$repo_project")/_apis/git/repositories/$repo_name?api-version=7.1" 2>/dev/null) \
+        || die "there is no repo $repo_spec (or no access to it)"
+    repo_id=$(jq -r .id <<< "$info")
+    heads=$(api "/$(project_path "$repo_project")/_apis/git/repositories/$repo_id/refs?filter=heads/&\$top=1000&api-version=7.1" |
+        jq -r '.value[].name | sub("^refs/heads/"; "")') || die "could not list the branches of $repo_spec"
+    existing=$(grep -E "(^|/)$id[-_]" <<< "$heads" | head -n 1)
+    if [ -n "$existing" ]; then
+        name=$existing
+    else
+        name=$("$SELF" branch "$id" --repo "$repo_spec" --dry-run | sed -n 's/^new branch  *//p')
+        [ -n "$name" ] || die "could not work out a branch name for work item $id"
+    fi
+
+    # the state to move to: the first of START_STATES that the type has, unless it is in one of them already
+    states=$(api "/${project// /%20}/_apis/wit/workitemtypes/${type// /%20}/states?api-version=7.1" | jq -r '.value[].name') || exit 1
+    IFS='|' read -ra want <<< "$START_STATES"
+    for state in "${want[@]}"; do
+        [ "$state" = "$current" ] && { target=""; break; }
+        [ -z "$target" ] && grep -qxF -- "$state" <<< "$states" && target=$state
+    done
+
+    summary="branch $name ($([ -n "$existing" ] && echo "exists" || echo "new"))"
+    [ -n "$target" ] && summary+=", $current -> $target"
+    if [ "$plan" = 1 ]; then
+        echo "$summary"
+        return
+    fi
+    confirm_cli "Start work on $id ($title): $summary?" "$yes" || { echo "not started"; return; }
+
+    if [ -z "$existing" ]; then
+        out=$("$SELF" branch "$id" --repo "$repo_spec" --link --yes 2>&1) || die "${out##*$'\n'}"
+        echo "created $name"
+    fi
+    if [ -n "$target" ]; then
+        "$SELF" state "$id" "$target" --yes > /dev/null || die "the branch is made, but the state of work item $id was not changed"
+        echo "work item $id: $current -> $target"
+    fi
+    [ "$terminal" = 1 ] || return 0
+
+    if clone=$(find_clone "$repo_spec"); then
+        setsid foot --working-directory "$clone" bash -c \
+            'git fetch origin "$1" && git switch "$1"; exec "${SHELL:-bash}"' _ "$name" >/dev/null 2>&1 &
+        echo "opened a terminal on $name in $clone"
+    else
+        echo "no clone of $repo_spec found (CLONE in the config); to work on it: git fetch origin $name && git switch $name"
+    fi
+}
+
+# --- the fuzzel menu --------------------------------------------------------------------------------
+
+# The entries of the menu are "url TAB label TAB kind TAB ref" lines. The kind says what an entry is and decides
+# its actions (Enter on an entry): pr (waits for your review), pr-mine, run (a failed one), item, search, none.
+# The ref is the number of the pull request, run or work item.
+
+# item_entries: menu entries for work items (JSON lines of work_items on stdin)
+item_entries() {
+    jq -r '"\(.url)\t\(.type | sub("Product Backlog Item"; "PBI"))  #\(.id)  \(.state)  \(.title)\titem\t\(.id)"'
+}
+
+# menu_entries [items]: the entries for the picker. Without items: the search entry, waiting PRs, the failed
+# runs, your own PRs, then your work items. With items: only your work items.
+# The search entry has the url ado:search; cmd_menu answers it by asking what to search for.
 menu_entries() {
-    local prs failed
+    local prs failed items
+    items=$(work_items | item_entries)
     if [ "$1" = items ]; then
-        work_items | jq -r '"\(.url)\t\(.type | sub("Product Backlog Item"; "PBI"))  #\(.id)  \(.state)  \(.title)"'
+        echo "$items"
         return
     fi
     prs=$(pull_requests) || return 1
     failed=$(runs) || return 1
     failed=$(annotate_runs "$failed" "$prs")
     {
-        jq -r 'select(.waiting) | "\(.url)\t* review  !\(.id)  \(.title)  (\(.author))\(if (.via | length) > 0 then "  via " + (.via | join(", ")) else "" end)"' <<< "$prs"
-        jq -r 'select(.attention) | "\(.url)\t! failed  \(.name)  \(.branch)  #\(.number)"' <<< "$failed"
-        jq -r 'select(.mine) | "\(.url)\t  my PR   !\(.id)  \(.title)"' <<< "$prs"
+        printf 'ado:search\t? search work items...\tsearch\t\n'
+        jq -r 'select(.waiting) | "\(.url)\t* review  !\(.id)  \(.title)  (\(.author))\(if (.via | length) > 0 then "  via " + (.via | join(", ")) else "" end)\tpr\t\(.id)"' <<< "$prs"
+        jq -r 'select(.attention) | "\(.url)\t! failed  \(.name)  \(.branch)  #\(.number)\trun\t\(.id)"' <<< "$failed"
+        jq -r 'select(.mine) | "\(.url)\t  my PR   !\(.id)  \(.title)\tpr-mine\t\(.id)"' <<< "$prs"
+        echo "$items"
     } | sed '/^$/d'
 }
 
+# The things you picked last are listed first (the last five, kept in RECENT as "kind TAB ref" lines).
+RECENT=${XDG_STATE_HOME:-$HOME/.local/state}/ado/recent
+
+# record_recent KIND REF: remember that you picked this entry
+record_recent() {
+    local line
+    line=$(printf '%s\t%s' "$1" "$2")
+    mkdir -p "$(dirname "$RECENT")"
+    { grep -vxF -- "$line" "$RECENT" 2>/dev/null; echo "$line"; } | tail -n 5 > "$RECENT.new" && mv "$RECENT.new" "$RECENT"
+}
+
+# reorder_recent ENTRIES: the entries with the search entry first, then those you picked last (the newest first),
+# then the others as they were
+reorder_recent() {
+    [ -s "$RECENT" ] || { echo "$1"; return; }
+    awk -F'\t' -v OFS='\t' '
+        NR == FNR { rank[$1 FS $2] = NR; next }
+        { key = $3 FS $4
+          if ($3 == "search") group = 0; else if (key in rank) group = 1; else group = 2
+          print group, (group == 1 ? -rank[key] : 0), FNR, $0 }' "$RECENT" - <<< "$1" |
+        sort -t$'\t' -k1,1n -k2,2n -k3,3n | cut -f4-
+}
+
+# search_entries TEXT: menu entries for the work items whose title contains TEXT
+search_entries() {
+    search_items "$1" | item_entries
+}
+
+# open_url URL: open it in Firefox and bring that window to the front (sway does not let a new tab take the
+# focus by itself, so the page would open out of sight)
+open_url() {
+    setsid firefox "$1" >/dev/null 2>&1 &
+    sleep 0.4
+    swaymsg '[app_id="org.mozilla.firefox"] focus' >/dev/null 2>&1
+}
+
+say() { notify-send -a ado "$@"; }
+
+# pick_menu PROMPT: choose one line of stdin in fuzzel and print its index (fails when you close it)
+pick_menu() {
+    local lines
+    lines=$(cat)
+    fuzzel --dmenu --index --prompt "$1> " --width 60 --lines "$(wc -l <<< "$lines")" <<< "$lines"
+}
+
+# confirm_menu QUESTION: a yes/no in fuzzel, with No first so that a stray Enter does nothing
+confirm_menu() {
+    local answer
+    answer=$(printf 'No\nYes\n' | fuzzel --dmenu --index --prompt "$1 " --width 100 --lines 2) || return 1
+    [ "$answer" = 1 ]
+}
+
+# run_action ARGS...: run ado with ARGS and show what it printed as a notification
+run_action() {
+    local out
+    if out=$("$SELF" "$@" 2>&1); then
+        say "ado" "${out:-done}"
+    else
+        say -u critical "ado: failed" "${out:-no message}"
+    fi
+}
+
+# show_comments NUMBER URL: the open comment threads of a pull request in fuzzel; picking one opens it
+show_comments() {
+    local id=$1 url=$2 pr threads list choice
+    pr=$(pr_json "$id") || { say -u critical "ado" "there is no pull request $id"; return; }
+    threads=$(pr_threads "$(jq -r .repository.project.id <<< "$pr")" "$(jq -r .repository.id <<< "$pr")" "$id")
+    [ -n "$threads" ] || { say "ado" "no open comments on !$id"; return; }
+    list=$(paste -d $'\t' <(jq -r --arg url "$url" '"\($url)?discussionId=\(.id)"' <<< "$threads") <(thread_line <<< "$threads"))
+    choice=$(cut -f2 <<< "$list" | fuzzel --dmenu --index --prompt "!$id comments> " --width 120 --lines 12) || return 0
+    open_url "$(sed -n "$((choice + 1))p" <<< "$list" | cut -f1)"
+}
+
+# menu_actions KIND REF URL: what you can do with the entry you picked (Open comes first)
+menu_actions() {
+    local kind=$1 ref=$2 url=$3 labels=("Open") keys=(open) choice key plan name states new
+    case $kind in
+        pr)      labels+=("Approve" "Approve with suggestions" "Wait for the author" "Reject" "Reset my vote" "Show open comments" "Copy link" "Copy checkout command")
+                 keys+=(vote-approve vote-suggest vote-wait vote-reject vote-reset comments link checkout) ;;
+        pr-mine) labels+=("Show open comments" "Copy link" "Copy checkout command")
+                 keys+=(comments link checkout) ;;
+        run)     labels+=("Run it again" "Copy link")
+                 keys+=(rerun link) ;;
+        item)    labels+=("Start work" "Create a branch" "Change state" "Copy number" "Copy link")
+                 keys+=(start branch state number link) ;;
+        *)       open_url "$url"; return ;;
+    esac
+    choice=$(printf '%s\n' "${labels[@]}" | pick_menu "actions") || return 0
+    key=${keys[$choice]}
+    case $key in
+        open)     open_url "$url" ;;
+        link)     wl-copy "$url"; say "ado" "link copied" ;;
+        number)   wl-copy "$ref"; say "ado" "$ref copied" ;;
+        checkout) wl-copy "$("$SELF" checkout "$ref" --print)"; say "ado" "checkout command copied" ;;
+        comments) show_comments "$ref" "$url" ;;
+        vote-*)   confirm_menu "${labels[$choice]} !$ref?" && run_action vote "$ref" "${key#vote-}" --yes ;;
+        rerun)    confirm_menu "Run it again?" && run_action rerun "$ref" --yes ;;
+        start)
+            plan=$("$SELF" start "$ref" --plan 2>&1) || { say -u critical "ado: cannot start" "$plan"; return; }
+            confirm_menu "Start work on $ref: $plan?" && run_action start "$ref" --yes ;;
+        branch)
+            # --dry-run shows the name; it also fails when the work item has a branch already
+            plan=$("$SELF" branch "$ref" --dry-run 2>&1) || { say -u critical "ado: no branch" "$plan"; return; }
+            name=$(sed -n 's/^new branch  *//p' <<< "$plan")
+            confirm_menu "Create branch $name, linked to $ref?" && run_action branch "$ref" --link --yes ;;
+        state)
+            states=$("$SELF" state "$ref" --list 2>&1) || { say -u critical "ado: no states" "$states"; return; }
+            choice=$(pick_menu "move $ref to" <<< "$states") || return 0
+            new=$(sed -n "$((choice + 1))p" <<< "$states")
+            confirm_menu "Move work item $ref to $new?" && run_action state "$ref" "$new" --yes ;;
+    esac
+}
+
 cmd_menu() {
-    local entries choice url mode="" print=0 arg
+    local entries choice status url kind ref mode="" print=0 raw=0 arg query=""
     for arg in "$@"; do
         case $arg in
             items)   mode=items ;;
+            search)  mode=search ;;
             --print) print=1 ;;
+            --raw)   print=1; raw=1 ;;
+            *)       [ "$mode" = search ] && query+="${query:+ }$arg" ;;
         esac
     done
-    entries=$(menu_entries "$mode") || exit 1
+
+    if [ "$mode" = search ]; then
+        # no words given: ask for them in fuzzel (an empty list, so only the typed text counts)
+        if [ -z "$query" ]; then
+            [ "$print" = 1 ] && die "ado menu search --print needs the words to search for"
+            query=$(fuzzel --dmenu --lines 0 --prompt 'work item> ' --width 60 < /dev/null) || exit 0
+        fi
+        query=$(xargs <<< "$query" 2>/dev/null || echo "$query")
+        [ -n "$query" ] || exit 0
+        # a number is a work item: open it without a search (the URL without a project redirects)
+        if [[ $query =~ ^#?([0-9]+)$ ]]; then
+            url="https://dev.azure.com/$ORG/_workitems/edit/${BASH_REMATCH[1]}"
+            [ "$print" = 1 ] && { echo "$url"; return; }
+            open_url "$url"
+            exit 0
+        fi
+        entries=$(search_entries "$query") || exit 1
+        [ -n "$entries" ] || entries=$'about:blank\tno work item found for: '"$query"
+    else
+        entries=$(menu_entries "$mode") || exit 1
+        entries=$(reorder_recent "$entries")
+    fi
     [ -n "$entries" ] || entries=$'about:blank\tnothing to show'
     if [ "$print" = 1 ]; then
-        cut -f2 <<< "$entries"
+        if [ "$raw" = 1 ]; then echo "$entries"; else cut -f2 <<< "$entries"; fi
         return
     fi
-    choice=$(cut -f2 <<< "$entries" | fuzzel --dmenu --index --prompt 'devops> ' --width 100 --lines 12) || exit 0
-    url=$(sed -n "$((choice + 1))p" <<< "$entries" | cut -f1)
+
+    # Enter asks what to do with the entry (Open is the first action); Alt+1 (fuzzel's custom-1: exit status 10)
+    # opens it at once
+    choice=$(cut -f2 <<< "$entries" | fuzzel --dmenu --index --prompt 'devops (Alt+1: open)> ' --width 100 --lines 12)
+    status=$?
+    case $status in 0|10) ;; *) exit 0 ;; esac
+    IFS=$'\t' read -r url _ kind ref <<< "$(sed -n "$((choice + 1))p" <<< "$entries")"
     [ "$url" = about:blank ] && exit 0
-    exec firefox "$url" >/dev/null 2>&1
+    [ "$kind" = search ] && exec "$SELF" menu search
+    record_recent "$kind" "$ref"
+    if [ "$status" = 10 ]; then
+        open_url "$url"
+    else
+        menu_actions "$kind" "$ref" "$url"
+    fi
 }
 
-# refresh: store the counts, or the reason they could not be looked up, for `ado status`
+# --- refresh, notifications -------------------------------------------------------------------------
+
+# refresh_snapshot PRS RUNS COMMENTS: what the pull requests and runs look like now, as one JSON object, for
+# comparing with the last refresh. COMMENTS is {pull request number: how many comments are open}.
+#   review: the pull requests waiting for you         failed: the runs that need you
+#   mine:   your own pull requests, with their votes and open comments
+#   nudge:  what has been waiting too long: a review for NUDGE_REVIEW_HOURS, a pull request of yours without any
+#           vote for NUDGE_PR_DAYS (the key says which one, the value what to tell you)
+refresh_snapshot() {
+    jq -n --argjson now "$(date +%s)" --argjson hours "$NUDGE_REVIEW_HOURS" --argjson days "$NUDGE_PR_DAYS" \
+          --argjson comments "$3" --slurpfile prs <(echo "$1") --slurpfile runs <(echo "$2") '
+        def vname: sub("^.*\\\\"; "");
+        def age: (sub("\\.[0-9]+"; "") | fromdateiso8601) as $created | $now - $created;
+        {
+            taken: $now,
+            review: ([$prs[] | select(.waiting) | {key: (.id | tostring), value: {title, author, age: (.created | age)}}] | from_entries),
+            failed: ([$runs[] | select(.attention) | {key: (.id | tostring), value: {name, branch, number}}] | from_entries),
+            mine:   ([$prs[] | select(.mine) | {key: (.id | tostring), value: {
+                          title, draft: .draft, age: (.created | age),
+                          votes: (.votes | map({key: (.name | vname), value: .vote}) | from_entries),
+                          comments: ($comments[.id | tostring] // 0)}}] | from_entries)
+        }
+        | .nudge = ([(.review | to_entries[] | select(.value.age >= $hours * 3600)
+                      | {key: "review-\(.key)", value: "waiting \(.value.age / 3600 | floor)h for your review: !\(.key)  \(.value.title)"}),
+                     (.mine | to_entries[] | select((.value.draft | not) and .value.age >= $days * 86400
+                                                    and ([.value.votes[] | select(. != 0)] | length) == 0)
+                      | {key: "mine-\(.key)", value: "no review yet after \(.value.age / 86400 | floor)d: !\(.key)  \(.value.title)"})]
+                    | from_entries)'
+}
+
+# refresh_events OLD NEW: what is new in the snapshot NEW since the snapshot OLD, one "urgency TAB title TAB text"
+# line each: a review that was asked, a failed run, a vote or a comment on a pull request of yours, a nudge
+refresh_events() {
+    jq -r --argjson old "$1" '
+        def vtext: if . == 10 then "approved" elif . == 5 then "approved with suggestions"
+                   elif . == -5 then "is waiting for the author" else "rejected" end;
+        . as $new
+        | ($new.review | to_entries[] | select($old.review[.key] == null)
+           | "normal\tReview asked\t!\(.key)  \(.value.title)  (\(.value.author))"),
+          ($new.failed | to_entries[] | select($old.failed[.key] == null)
+           | "critical\tRun failed\t\(.value.name)  \(.value.branch)  #\(.value.number)"),
+          ($new.mine | to_entries[] | .key as $id | .value as $now | $old.mine[$id] as $then | select($then != null)
+           | (($now.votes | to_entries[] | select(.value != 0 and ($then.votes[.key] // 0) != .value)
+               | "\(if .value < 0 then "critical" else "normal" end)\t\(.key) \(.value | vtext)\t!\($id)  \($now.title)"),
+              (select($now.comments > $then.comments) | "normal\tNew comment\t!\($id)  \($now.title)"))),
+          ($new.nudge | to_entries[] | select($old.nudge[.key] == null) | "low\tStill waiting\t\(.value)")' <<< "$2"
+}
+
+# notify_events OLD NEW: show what refresh_events finds as notifications (not with NOTIFY=0 in the config)
+notify_events() {
+    local urgency title text
+    [ "$NOTIFY" = 0 ] && return
+    refresh_events "$1" "$2" | while IFS=$'\t' read -r urgency title text; do
+        notify-send -a ado -u "$urgency" "$title" "$text"
+    done
+}
+
+# refresh: store the counts, or the reason they could not be looked up, for `ado status`; tell what is new since
+# the last time (nothing the first time: that would be a notification for everything that is open already)
 cmd_refresh() {
-    local prs failed review mine broken
+    local prs failed annotated review mine broken threads=0 line n open comments_json='{}' snapshot old review_old mine_idle
+    local file="$CACHE/snapshot.json"
     mkdir -p "$CACHE"
     if prs=$(pull_requests) && failed=$(runs); then
+        annotated=$(annotate_runs "$failed" "$prs")
         review=$(jq -s '[.[] | select(.waiting)] | length' <<< "$prs")
         mine=$(jq -s '[.[] | select(.mine)] | length' <<< "$prs")
-        broken=$(jq -s '[.[] | select(.attention)] | length' <<< "$(annotate_runs "$failed" "$prs")")
-        jq -n --argjson review "$review" --argjson mine "$mine" --argjson failed "$broken" --arg at "$(date +%s)" \
-            '{review: $review, mine: $mine, failed: $failed, at: ($at | tonumber)}' > "$CACHE/summary.json"
+        broken=$(jq -s '[.[] | select(.attention)] | length' <<< "$annotated")
+        # the open comment threads on your own pull requests (a lookup that fails counts as none)
+        while IFS= read -r line; do
+            open=$(pr_threads "$(jq -r .path <<< "$line")" "$(jq -r .repo_id <<< "$line")" "$(jq -r .id <<< "$line")")
+            n=$(jq -s 'length' <<< "$open")
+            threads=$(( threads + n ))
+            comments_json=$(jq -c --arg id "$(jq -r .id <<< "$line")" --argjson n "$(jq -s 'map(1 + .replies) | add // 0' <<< "$open")" \
+                '. + {($id): $n}' <<< "$comments_json")
+        done < <(jq -c 'select(.mine)' <<< "$prs")
+
+        snapshot=$(refresh_snapshot "$prs" "$annotated" "$comments_json")
+        if [ -r "$file" ] && old=$(jq -c 'select(.taken)' "$file") && [ -n "$old" ]; then
+            notify_events "$old" "$snapshot"
+        fi
+        echo "$snapshot" > "$file.new" && mv "$file.new" "$file"
+
+        review_old=$(jq '[.nudge | keys[] | select(startswith("review-"))] | length' <<< "$snapshot")
+        mine_idle=$(jq '[.nudge | keys[] | select(startswith("mine-"))] | length' <<< "$snapshot")
+        jq -n --argjson review "$review" --argjson mine "$mine" --argjson failed "$broken" --argjson comments "$threads" \
+              --argjson review_old "$review_old" --argjson mine_idle "$mine_idle" --arg at "$(date +%s)" \
+            '{review: $review, mine: $mine, failed: $failed, comments: $comments, review_old: $review_old,
+              mine_idle: $mine_idle, at: ($at | tonumber)}' > "$CACHE/summary.json"
     else
         jq -n --arg at "$(date +%s)" '{error: "login", at: ($at | tonumber)}' > "$CACHE/summary.json"
         exit 1
@@ -612,12 +1211,18 @@ command=${1:-}
 
 case $command in
     ""|-h|--help|help) usage; exit 0 ;;
-    prs|runs|items|item|branch|menu|refresh|status) ;;
+    prs|runs|items|item|branch|start|vote|comments|checkout|rerun|state|menu|refresh|status) ;;
     *) die "unknown command '$command' (ado --help)" ;;
 esac
 
 load_config
 case $command in
+    start)    cmd_start "$@" ;;
+    vote)     cmd_vote "$@" ;;
+    comments) cmd_comments "$@" ;;
+    checkout) cmd_checkout "$@" ;;
+    rerun)    cmd_rerun "$@" ;;
+    state)    cmd_state "$@" ;;
     prs)     cmd_prs ;;
     runs)    cmd_runs "$@" ;;
     items)   cmd_items "$@" ;;
