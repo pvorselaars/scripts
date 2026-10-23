@@ -298,24 +298,27 @@ privacy() {
     fi
 }
 
-# Azure DevOps: pull requests waiting for your review (orange) and failed pipeline runs of yours (red).
+# Azure DevOps: pull requests waiting for your review (orange, red when one has waited too long), failed
+# pipeline runs of yours (red) and open comments on your pull requests (blue).
 # `ado refresh` writes the numbers every few minutes (a systemd timer); this module only reads them.
 # A key means that az needs a new sign-in, or that the numbers have not been refreshed for a while.
 devops() {
-    local file="${XDG_RUNTIME_DIR:-/tmp}/ado/summary.json" error at review failed shown=()
+    local file="${XDG_RUNTIME_DIR:-/tmp}/ado/summary.json" error at review failed comments review_old shown=() part review_color=$ORANGE
     [ -r "$file" ] || return
-    read -r error at review failed < <(jq -r '[(.error // "-"), (.at // 0), (.review // 0), (.failed // 0)] | join(" ")' "$file")
+    read -r error at review failed comments review_old < <(jq -r '[(.error // "-"), (.at // 0), (.review // 0), (.failed // 0), (.comments // 0), (.review_old // 0)] | join(" ")' "$file")
+    [ "$review_old" -gt 0 ] && review_color=$RED        # a review has been waiting too long (NUDGE_REVIEW_HOURS in ado's config)
 
     if [ "$error" != "-" ] || [ $(( $(date +%s) - at )) -gt 1200 ]; then
         paint "$DIM" $'\U000F0306'      # key
         return
     fi
-    [ "$review" -gt 0 ] && shown+=("<span foreground=\"$ORANGE\">"$'\U000F062C'" $review</span>")     # branch
+    [ "$review" -gt 0 ] && shown+=("<span foreground=\"$review_color\">"$'\U000F062C'" $review</span>")     # branch
     [ "$failed" -gt 0 ] && shown+=("<span foreground=\"$RED\">"$'\U000F0028'" $failed</span>")        # alert circle
+    [ "$comments" -gt 0 ] && shown+=("<span foreground=\"$BLUE\">"$'\U000F0188'" $comments</span>")   # comment: open threads on your PRs
 
     if [ "${#shown[@]}" -gt 0 ]; then
         res="${shown[0]}"
-        [ "${#shown[@]}" -gt 1 ] && res+=" ${shown[1]}"
+        for part in "${shown[@]:1}"; do res+="$GAP$part"; done      # not a plain space: that would be drawn as a dot between two icons
     elif [ "$all" = 1 ]; then
         paint "$DIM" $'\U000F062C'" 0"
     fi
