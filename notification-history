@@ -1,0 +1,33 @@
+#!/bin/bash
+# notification-history: browse the notifications mako has dismissed or let expire, in fuzzel.
+# The newest is first. Picking one copies its text (summary and body) to the clipboard.
+#
+#   notification-history            pick one and copy it
+#   notification-history --print    list the entries without showing the menu
+#
+# mako keeps the history only while it runs, and not longer than max-history in its config (default 5).
+
+menu() { fuzzel --dmenu --index --prompt 'notifications> ' --width 100 --lines 12; }
+
+# entries: one JSON object per notification, the newest first, with the one line label for the menu
+entries() {
+    makoctl history -j | jq -c '
+        sort_by(.id) | reverse | .[]
+        | .body = (.body // "") | .summary = (.summary // "")
+        | .label = "\(.app_name // "-" | .[0:12] | . + (" " * (12 - length)))  \(.summary)\(if .body != "" then "  -  " + (.body | gsub("\n"; " ")) else "" end)"'
+}
+
+list=$(entries) || { echo "notification-history: makoctl history failed (is mako running?)" >&2; exit 1; }
+[ -n "$list" ] || list=$(jq -nc '{label: "no notifications in the history", empty: true}')
+
+if [ "$1" = --print ]; then
+    jq -r .label <<< "$list"
+    exit 0
+fi
+
+choice=$(jq -r .label <<< "$list" | menu) || exit 0
+picked=$(sed -n "$((choice + 1))p" <<< "$list")
+[ "$(jq -r '.empty // false' <<< "$picked")" = true ] && exit 0
+
+jq -j '.summary, (if .body != "" then "\n" + .body else "" end)' <<< "$picked" | wl-copy
+notify-send -a notifications -t 1500 "Copied" "$(jq -r .summary <<< "$picked")"
