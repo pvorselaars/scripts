@@ -10,6 +10,7 @@ Small scripts for the sway desktop and for development. They are linked into `~/
 | `statusbar`, `statusbar-refresh` | The swaybar status line, and a way to redraw it (or show every module) at once |
 | `lock-screen` | Lock with a blurred snapshot of the screen |
 | `lid-handler` | Lid open/close and docking: switch the laptop panel off when docked |
+| `privacy-status` | Says whether the microphone, the camera or a screen share is in use; the status bar shows an icon for each |
 | `presentation-mode` | Toggle do-not-disturb, night light and idle lock |
 | `scale-step` | Make the display bigger or smaller (`reset` goes back) |
 | `minimize-all` | "Show desktop": windows to the scratchpad and back |

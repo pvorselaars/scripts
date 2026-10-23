@@ -1,0 +1,56 @@
+#!/bin/bash
+# privacy-status: what is listening or watching right now. Prints one or more of
+#   mic       an app is recording from a microphone (the level meter of pavucontrol does not count)
+#   camera    an app is using the webcam, through PipeWire or by opening /dev/video* itself
+#   screen    your screen is being shared through the portal (xdg-desktop-portal-wlr)
+# and nothing when none of them is active. The status bar shows an icon for each.
+#
+# The screen share check looks for a running PipeWire node that belongs to the portal; it has not been
+# tried with a real screen share yet.
+# PRIVACY_PW_DUMP replaces the `pw-dump` command, for testing.
+
+PW_DUMP=${PRIVACY_PW_DUMP:-pw-dump}
+
+# direct_camera: succeed when a program other than PipeWire has a video device open
+direct_camera() {
+    local pid comm
+    for pid in $(find /proc/[0-9]*/fd -maxdepth 1 -lname '/dev/video*' 2>/dev/null |
+                 sed -E 's#/proc/([0-9]+)/.*#\1#' | sort -u); do
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+        case $comm in
+            pipewire|wireplumber|pipewire-pulse) ;;     # they keep the device open for PipeWire users
+            *) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+dump=$(bash -c "$PW_DUMP" 2>/dev/null) || dump='[]'
+
+# one word per active kind, from the PipeWire nodes that are running
+words=$(jq -r '
+    . as $all
+    | [$all[] | select(.type == "PipeWire:Interface:Client")
+              | select((.info.props["application.process.binary"] // "") | test("xdg-desktop-portal-wlr"))
+              | .id] as $portal
+    | [$all[] | select(.type == "PipeWire:Interface:Node") | select(.info.state == "running")] as $running
+    | [
+        (if any($running[]; .info.props["media.class"] == "Stream/Input/Audio"
+                and ((.info.props["application.name"] // "") | test("Volume Control|pavucontrol"; "i") | not)
+                and (.info.props["media.name"] // "") != "Peak detect") then "mic" else empty end),
+        (if any($running[]; .info.props["media.class"] == "Stream/Input/Video"
+                or (.info.props["media.class"] == "Video/Source" and .info.props["device.api"] == "v4l2")) then "camera" else empty end),
+        (if any($running[]; ((.info.props["media.class"] // "") | test("Video"))
+                and ((.info.props["client.id"] // -1) as $client | $portal | index($client) != null)) then "screen" else empty end)
+      ] | .[]' <<< "$dump")
+
+# a program that opens the camera itself is not a PipeWire node
+if direct_camera && ! grep -qx camera <<< "$words"; then
+    words=$(printf '%s\n' "$words" camera | sed '/^$/d')
+fi
+
+# fixed order: mic, camera, screen
+for kind in mic camera screen; do
+    grep -qx "$kind" <<< "$words" && echo "$kind"
+done | tr '\n' ' ' | sed 's/ $//'
+echo

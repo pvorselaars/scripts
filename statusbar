@@ -3,6 +3,7 @@
 #
 # Modules that only matter sometimes stay hidden until they do:
 #   - REC while recording, a presentation icon in presentation mode, do-not-disturb
+#   - the microphone, the camera or a screen share, while one of them is in use (see `privacy-status`)
 #   - the playing track
 #   - cpu, ram and disk when high; battery when low
 #   - brightness and volume for a few seconds after a change
@@ -274,6 +275,29 @@ battery() {
     fi
 }
 
+# privacy: an icon for each of the microphone, the camera and a screen share that is in use right now
+# (see privacy-status). It only changes at a refresh, so it can lag by up to IDLE seconds.
+privacy() {
+    local kinds kind shown=() icon
+    kinds=$("$HOME/Projects/scripts/privacy-status") || return
+    for kind in $kinds; do
+        case $kind in
+            mic)    shown+=("<span foreground=\"$RED\">"$'\U000F036C'"</span>") ;;
+            camera) shown+=("<span foreground=\"$RED\">"$'\U000F0100'"</span>") ;;
+            screen) shown+=("<span foreground=\"$ORANGE\">"$'\U000F0379'"</span>") ;;
+        esac
+    done
+
+    if [ "${#shown[@]}" -gt 0 ]; then
+        res="${shown[0]}"
+        for icon in "${shown[@]:1}"; do
+            res+="$GAP$icon"        # not a plain space: that would be drawn as a dot between two icons
+        done
+    elif [ "$all" = 1 ]; then
+        paint "$DIM" $'\U000F036C'
+    fi
+}
+
 # Azure DevOps: pull requests waiting for your review (orange) and failed pipeline runs of yours (red).
 # `ado refresh` writes the numbers every few minutes (a systemd timer); this module only reads them.
 # A key means that az needs a new sign-in, or that the numbers have not been refreshed for a while.
@@ -370,7 +394,7 @@ read_show_all() {
 # prints the whole status line: the modules that have something to show, then the clock
 draw() {
     local parts=() module line part
-    for module in rec pres cpu mem disk net brightness bluetooth wifi volume dnd profile battery devops media; do
+    for module in rec privacy pres cpu mem disk net brightness bluetooth wifi volume dnd profile battery devops media; do
         res=""
         $module
         [ -n "$res" ] && parts+=("$res")
