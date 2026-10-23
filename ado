@@ -30,12 +30,17 @@
 #   ado rerun [RUN_ID]       queue a run of a pipeline again on the same branch; without an id, pick one of
 #                            your failed runs (--yes skips the question)
 #   ado state [ID] [STATE]   move a work item to another state, e.g. Done; without them, pick (--yes, --list)
+#   ado sprint [--mine] [--all]  the work items of your team in the current sprint, by state (--all: done ones too)
+#   ado new [TYPE] TITLE...  make a work item: a Task unless you say task, bug, pbi, devbug, feature or impediment;
+#                            assigned to you, in the current sprint and your team's area. --parent ID makes
+#                            it a child of that work item; also --assign, --iteration, --description, --plan,
+#                            --yes, --open
 #   ado menu [items]         pick a pull request, a failed run or one of your work items (with items: only
 #                            the work items) in fuzzel. Enter shows what you can do with it: open it in
 #                            Firefox, vote, show the open comments, copy the link or the checkout command,
-#                            run it again, start work, create a branch, change the state. Alt+1 opens it at
-#                            once. The first entry searches all work items; the last five things you picked
-#                            come right after it.
+#                            run it again, start work, create a branch, change the state. The first entries
+#                            search all work items, make a new one and show the sprint board; the last five
+#                            things you picked come right after them.
 #   ado menu search [WORDS]  search the titles of all work items (not only yours) for WORDS, or for what you
 #                            type in fuzzel; pick one to open it. A number (156438 or #156438) opens that
 #                            work item directly.
@@ -60,6 +65,8 @@
 #   IGNORE_GROUPS=Testers                        words in team names that must not make a PR wait for you
 #   ITEM_STATES=Committed|In Progress|To Do      the states that mean a work item is being worked on (| between them)
 #   START_STATES=In Progress|Committed           where ado start moves a work item to: the first of these its type has
+#   TEAM=Constructie                             your team: its current sprint and its area are where ado sprint and ado new work
+#   ITEM_PROJECT=Cito                            the project of the work items (the repos can be in another one)
 #   MERGE_STRATEGY=squash                        how ado complete merges: squash, noFastForward, rebase or rebaseMerge
 #   CLONE=~/Projects/x/repo                      the clone ado start opens a terminal in (else the folder you are in,
 #                                                or a clone of the repo found in ~/Projects)
@@ -97,11 +104,13 @@ load_config() {
     START_STATES="In Progress|Committed"
     CLONE=""
     MERGE_STRATEGY=squash
+    TEAM=Constructie
+    ITEM_PROJECT=Cito
     NOTIFY=1
     NUDGE_REVIEW_HOURS=24
     NUDGE_PR_DAYS=2
     if [ -r "$CONFIG" ]; then
-        for name in ORG PROJECTS REPO IGNORE_GROUPS ITEM_STATES START_STATES CLONE MERGE_STRATEGY NOTIFY NUDGE_REVIEW_HOURS NUDGE_PR_DAYS; do
+        for name in ORG PROJECTS REPO IGNORE_GROUPS ITEM_STATES START_STATES CLONE MERGE_STRATEGY TEAM ITEM_PROJECT NOTIFY NUDGE_REVIEW_HOURS NUDGE_PR_DAYS; do
             value=$(sed -n "s/^$name=//p" "$CONFIG" | head -n 1)
             [ -n "$value" ] && printf -v "$name" '%s' "$value"
         done
@@ -315,7 +324,7 @@ html_to_text() {
 }
 
 # work_items [--all]: one JSON object per work item assigned to you, the most recently changed first:
-#   {id, type, state, title, project, iteration, url}
+#   {id, type, state, title, project, iteration, assigned, url}
 # The work items can be in another project than the code (here: Cito, while the repos are in QuestifyBuilder),
 # so the query is not limited to one project.
 work_items() {
@@ -350,7 +359,7 @@ items_from_ids() {
     local ids=$1
     [ -n "$ids" ] || return 0
 
-    api "/_apis/wit/workitems?ids=$ids&fields=System.Id,System.WorkItemType,System.State,System.Title,System.TeamProject,System.IterationPath&api-version=7.1" |
+    api "/_apis/wit/workitems?ids=$ids&fields=System.Id,System.WorkItemType,System.State,System.Title,System.TeamProject,System.IterationPath,System.AssignedTo&api-version=7.1" |
         jq -c --arg ids "$ids" --arg org "$ORG" '
             ($ids | split(",") | map(tonumber)) as $order
             | .value | sort_by(.id as $id | $order | index($id)) | .[] | {
@@ -360,6 +369,7 @@ items_from_ids() {
                 title: .fields["System.Title"],
                 project: .fields["System.TeamProject"],
                 iteration: (.fields["System.IterationPath"] | split("\\") | last),
+                assigned: (.fields["System.AssignedTo"].displayName // "-"),
                 url: "https://dev.azure.com/\($org)/\(.fields["System.TeamProject"] | @uri)/_workitems/edit/\(.id)"
             }'
 }
@@ -641,7 +651,7 @@ cmd_branch() {
 pr_json() { api "/_apis/git/pullrequests/$1?api-version=7.1"; }
 
 # pr_threads PROJECT REPO NUMBER: one JSON object per comment thread of a pull request that is still open:
-#   {id, status, file, line, author, text, replies}      (PROJECT and REPO as they go into a URL: names or ids)
+#   {id, status, file, line, author, text, replies, comments}      (comments: all of them, as {author, text}; PROJECT and REPO as they go into a URL: names or ids)
 pr_threads() {
     api "/$1/_apis/git/repositories/$2/pullRequests/$3/threads?api-version=7.1" | jq -c '
         .value[]
@@ -650,12 +660,22 @@ pr_threads() {
         | {id, status, file: .threadContext.filePath,
            line: (.threadContext.rightFileStart.line // .threadContext.leftFileStart.line),
            author: .comments[0].author.displayName, text: (.comments[0].content // ""),
-           replies: ((.comments | length) - 1)}'
+           replies: ((.comments | length) - 1),
+           comments: [.comments[] | select((.isDeleted | not) and ((.commentType // "text") != "system"))
+                      | {author: .author.displayName, text: (.content // "")}]}'
 }
 
 # thread_line: from threads (JSON lines) on stdin, one text line each: file:line, who, what, replies
 thread_line() {
     jq -r '"#\(.id)  \(.file // "(general)")\(if .line then ":\(.line)" else "" end)  \(.author): \(.text | gsub("\\s+"; " ") | .[0:90])\(if .replies > 0 then "  (+\(.replies))" else "" end)"'
+}
+
+# thread_view: from one thread (JSON) on stdin, the conversation as text: where it is, then each comment with its author.
+# At most the last 30 lines; the long lines are left to the reader to wrap.
+thread_view() {
+    jq -r '"\(.file // "(general)")\(if .line then ":\(.line)" else "" end)   [\(.status)]",
+           (.comments[] | "", "\(.author):", (.text | split("\n")[] | "  " + .))' |
+        awk '{ line[NR] = $0 } END { start = NR > 30 ? NR - 29 : 1; if (start > 1) print "... (" start - 1 " earlier lines left out)"; for (i = start; i <= NR; i++) print line[i] }'
 }
 
 # vote_value WORD: the number Azure DevOps keeps for a vote (fails for an unknown word)
@@ -713,13 +733,20 @@ cmd_vote() {
     echo "$(vote_text "$word"): !$id  $title"
 }
 
-# cmd_comments [NUMBER]: the open comment threads of a pull request; without a number, of all your own pull requests
+# cmd_comments [NUMBER [THREAD]]: the open comment threads of a pull request; without a number, of all your own pull
+# requests; with a thread number, that thread in full (every comment)
 cmd_comments() {
-    local id=${1#!} pr line threads
+    local id=${1#!} thread=${2#\#} pr line threads
     if [ -n "$id" ]; then
         [[ $id =~ ^[0-9]+$ ]] || die "a pull request number is needed"
         pr=$(pr_json "$id") || die "there is no pull request $id (or no access to it)"
         threads=$(pr_threads "$(jq -r .repository.project.id <<< "$pr")" "$(jq -r .repository.id <<< "$pr")" "$id") || exit 1
+        if [ -n "$thread" ]; then
+            threads=$(jq -c --argjson id "${thread:-0}" 'select(.id == $id)' <<< "$threads")
+            [ -n "$threads" ] || die "!$id has no open thread $thread (ado comments $id lists them)"
+            thread_view <<< "$threads"
+            return
+        fi
         [ -n "$threads" ] || { echo "no open comments on !$id"; return; }
         thread_line <<< "$threads"
         return
@@ -1050,6 +1077,170 @@ cmd_undo() {
     ADO_NO_UNDO=1 "$SELF" "${args[@]}" && rm -f "$UNDO"
 }
 
+# --- sprint, new work items ---------------------------------------------------------------------------
+
+# the order of the states in a list: the ones at the start of the work first
+STATE_ORDER='["New","Approved","To Do","Committed","In Progress","Done","Closed","Resolved","Removed"]'
+
+# team_path: your team as it goes into a URL: PROJECT/TEAM
+team_path() { echo "${ITEM_PROJECT// /%20}/${TEAM// /%20}"; }
+
+# team_area: the area path of your team (where its work items are)
+team_area() { api "/$(team_path)/_apis/work/teamsettings/teamfieldvalues?api-version=7.1" | jq -er '.defaultValue'; }
+
+# sprint_info: the current sprint of your team as JSON {name, path, start, end} (fails when there is none)
+sprint_info() {
+    api "/$(team_path)/_apis/work/teamsettings/iterations?\$timeframe=current&api-version=7.1" |
+        jq -ce '.value[0] | select(. != null) | {name, path, start: .attributes.startDate, end: .attributes.finishDate}'
+}
+
+# sprint_items [--mine] [--all]: the work items of your team in the current sprint (work_items JSON lines), the
+# states in STATE_ORDER and the most recently changed first. Not the ones that are done, unless --all.
+sprint_items() {
+    local mine="" closed=" AND [System.State] NOT IN ('Done','Removed','Closed','Resolved')" arg area query ids
+    for arg in "$@"; do
+        case $arg in
+            --mine) mine=" AND [System.AssignedTo] = @Me" ;;
+            --all)  closed="" ;;
+        esac
+    done
+    area=$(team_area) || return 1
+    query=$(jq -n --arg q "SELECT [System.Id] FROM WorkItems WHERE [System.IterationPath] = @CurrentIteration AND [System.AreaPath] UNDER '${area//\'/\'\'}'$mine$closed ORDER BY [System.ChangedDate] DESC" '{query: $q}')
+    ids=$(api_send POST "/$(team_path)/_apis/wit/wiql?\$top=200&api-version=7.1" "$query" | jq -r '[.workItems[].id] | join(",")') || return 1
+    items_from_ids "$ids" | jq -sc --argjson order "$STATE_ORDER" 'sort_by(.state as $s | ($order | index($s)) // 99) | .[]'
+}
+
+# cmd_sprint [--mine] [--all]: the work items of your team in the current sprint, by state
+cmd_sprint() {
+    local arg info data line kind a b c d
+    for arg in "$@"; do
+        case $arg in --mine|--all) ;; *) die "unknown argument $arg (ado --help)" ;; esac
+    done
+    info=$(sprint_info) || die "team $TEAM has no current sprint"
+    jq -r '"\(.name)  (\(.start[0:10]) to \(.end[0:10]))"' <<< "$info"
+    data=$(sprint_items "$@") || exit 1
+    [ -n "$data" ] || { echo "nothing in it"; return; }
+    jq -rs 'group_by(.state) | map({state: .[0].state, items: .}) | .[]
+            | "H\t\(.state) (\(.items | length))", (.items[] | "I\t\(.id)\t\(.type | sub("Product Backlog Item"; "PBI"))\t\(.assigned | split(" ")[0])\t\(.title)")' <<< "$data" |
+        while IFS=$'\t' read -r kind a b c d; do
+            if [ "$kind" = H ]; then echo; echo "$a"; else printf '  %-7s %-8s %-12.12s %s\n' "$a" "$b" "$c" "$d"; fi
+        done
+}
+
+# sprint_entries [--mine]: menu entries for the work items in the current sprint (with who has it)
+sprint_entries() {
+    sprint_items "$@" | jq -r '"\(.url)\t\(.state)  \(.type | sub("Product Backlog Item"; "PBI"))  #\(.id)  \(.assigned | split(" ")[0])  \(.title)\titem\t\(.id)"'
+}
+
+# new_type WORD: the work item type that WORD stands for (fails for a word that is none)
+new_type() {
+    case ${1,,} in
+        task)         echo "Task" ;;
+        bug)          echo "Bug" ;;
+        pbi|backlog)  echo "Product Backlog Item" ;;
+        devbug)       echo "Dev Bug" ;;
+        feature)      echo "Feature" ;;
+        impediment)   echo "Impediment" ;;
+        *)            return 1 ;;
+    esac
+}
+
+# my_account: the account name of you (what an Assigned To field takes)
+my_account() {
+    local file="$CACHE/account" account
+    if [ ! -s "$file" ]; then
+        account=$(api "/_apis/connectionData?api-version=7.1-preview" | jq -r '.authenticatedUser.properties.Account["$value"] // empty')
+        [ -n "$account" ] || return 1
+        mkdir -p "$CACHE"
+        echo "$account" > "$file"
+    fi
+    cat "$file"
+}
+
+# cmd_new [TYPE] TITLE... [options]: make a work item: a Task unless you name a type (task, bug, pbi, devbug,
+# feature, impediment), assigned to you, in the current sprint and the area of your team.
+#   --type T  --title TEXT   the same, for a title that starts with a word that is a type
+#   --parent ID              make it a child of that work item (a task under a PBI); it takes the area and sprint of the parent
+#   --assign me|none         who gets it (default: you)
+#   --iteration current|none|PATH   the sprint (default: the current one)
+#   --description TEXT  --plan  --yes  --open
+cmd_new() {
+    local type="" parent="" assign=me iteration=current title="" description="" yes=0 plan=0 open=0 words=() t
+    local project area iter account parent_item summary ops response id link who
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --type)        type=$(new_type "${2:-}") || die "unknown type '${2:-}' (task, bug, pbi, devbug, feature, impediment)"; shift ;;
+            --title)       title=${2:-}; shift ;;
+            --parent)      parent=${2#\#}; shift ;;
+            --assign)      assign=${2:-}; shift ;;
+            --iteration)   iteration=${2:-}; shift ;;
+            --description) description=${2:-}; shift ;;
+            --yes)         yes=1 ;;
+            --plan)        plan=1 ;;
+            --open)        open=1 ;;
+            -*)            die "unknown option $1 (ado --help)" ;;
+            *)             words+=("$1") ;;
+        esac
+        shift
+    done
+    if [ -z "$type" ] && [ -z "$title" ] && [ "${#words[@]}" -gt 1 ] && t=$(new_type "${words[0]}"); then
+        type=$t
+        words=("${words[@]:1}")
+    fi
+    [ -n "$title" ] || title="${words[*]}"
+    [ -n "$title" ] || die "usage: ado new [TYPE] TITLE... [--parent ID] [--assign me|none] [--iteration current|none|PATH] [--description TEXT] [--plan] [--yes] [--open]"
+    type=${type:-Task}
+    [ -z "$parent" ] || [[ $parent =~ ^[0-9]+$ ]] || die "--parent needs a work item number"
+
+    # where it goes: the sprint and area of the parent, else those of your team
+    if [ -n "$parent" ]; then
+        parent_item=$(api "/_apis/wit/workitems/$parent?api-version=7.1") || die "there is no work item $parent"
+        project=$(jq -r '.fields["System.TeamProject"]' <<< "$parent_item")
+        area=$(jq -r '.fields["System.AreaPath"]' <<< "$parent_item")
+        iter=$(jq -r '.fields["System.IterationPath"]' <<< "$parent_item")
+    else
+        project=$ITEM_PROJECT
+        area=$(team_area) || die "could not look up the area of team $TEAM"
+        iter=""
+    fi
+    case $iteration in
+        none)    iter="" ;;
+        current) [ -n "$iter" ] || iter=$(sprint_info | jq -r .path) ;;
+        *)       iter=$iteration ;;
+    esac
+    case $assign in
+        me)   account=$(my_account) || die "could not look up your account" ;;
+        none) account="" ;;
+        *)    die "--assign is me or none" ;;
+    esac
+
+    who=${account:+you}; who=${who:-nobody}
+    summary="$type \"$title\" in ${iter##*\\}, assigned to $who${parent:+, under #$parent}"
+    if [ "$plan" = 1 ]; then
+        echo "$summary"
+        return
+    fi
+    confirm_cli "Create $summary?" "$yes" || { echo "not created"; return; }
+
+    ops=$(jq -n --arg title "$title" --arg area "$area" --arg iter "$iter" --arg account "$account" --arg description "$description" \
+                --arg parent "$parent" --arg org "$ORG" '
+        [{op: "add", path: "/fields/System.Title", value: $title},
+         {op: "add", path: "/fields/System.AreaPath", value: $area}]
+        + (if $iter != "" then [{op: "add", path: "/fields/System.IterationPath", value: $iter}] else [] end)
+        + (if $account != "" then [{op: "add", path: "/fields/System.AssignedTo", value: $account}] else [] end)
+        + (if $description != "" then [{op: "add", path: "/fields/System.Description", value: $description}] else [] end)
+        + (if $parent != "" then [{op: "add", path: "/relations/-", value: {rel: "System.LinkTypes.Hierarchy-Reverse",
+                                   url: "https://dev.azure.com/\($org)/_apis/wit/workItems/\($parent)"}}] else [] end)')
+    response=$(api_send POST "/${project// /%20}/_apis/wit/workitems/\$${type// /%20}?api-version=7.1" "$ops" application/json-patch+json) || exit 1
+    id=$(jq -r '.id // "?"' <<< "$response")
+    echo "created $type $id: $title"
+    [ "$id" != "?" ] || return 0
+    link="https://dev.azure.com/$ORG/${project// /%20}/_workitems/edit/$id"
+    echo "$link"
+    [ "$open" = 1 ] && open_url "$link"
+    return 0
+}
+
 # --- start work ---------------------------------------------------------------------------------------
 
 # find_clone REPO_SPEC: the folder of a clone of PROJECT/REPO: CLONE from the config, the folder you are in, or
@@ -1140,7 +1331,8 @@ cmd_start() {
 # --- the fuzzel menu --------------------------------------------------------------------------------
 
 # The entries of the menu are "url TAB label TAB kind TAB ref" lines. The kind says what an entry is and decides
-# its actions (Enter on an entry): pr (waits for your review), pr-mine, run (a failed one), item, search, none.
+# its actions (Enter on an entry): pr (waits for your review), pr-mine, run (a failed one), item, and search, undo,
+# new and sprint, which are the entries at the top that do something themselves.
 # The ref is the number of the pull request, run or work item.
 
 # item_entries: menu entries for work items (JSON lines of work_items on stdin)
@@ -1164,6 +1356,8 @@ menu_entries() {
     {
         printf 'ado:search\t? search work items...\tsearch\t\n'
         if info=$(undo_info); then printf 'ado:undo\t<< undo: %s\tundo\t\n' "$info"; fi
+        printf 'ado:new\t+ new work item...\tnew\t\n'
+        printf 'ado:sprint\t? sprint board...\tsprint\t\n'
         jq -r 'select(.waiting) | "\(.url)\t* review  !\(.id)  \(.title)  (\(.author))\(if (.via | length) > 0 then "  via " + (.via | join(", ")) else "" end)\tpr\t\(.id)"' <<< "$prs"
         jq -r 'select(.attention) | "\(.url)\t! failed  \(.name)  \(.branch)  #\(.number)\trun\t\(.id)"' <<< "$failed"
         jq -r 'select(.mine) | "\(.url)\t  my PR   !\(.id)  \(.title)\tpr-mine\t\(.id)"' <<< "$prs"
@@ -1189,7 +1383,7 @@ reorder_recent() {
     awk -F'\t' -v OFS='\t' '
         NR == FNR { rank[$1 FS $2] = NR; next }
         { key = $3 FS $4
-          if ($3 == "search" || $3 == "undo") group = 0; else if (key in rank) group = 1; else group = 2
+          if ($3 == "search" || $3 == "undo" || $3 == "new" || $3 == "sprint") group = 0; else if (key in rank) group = 1; else group = 2
           print group, (group == 1 ? -rank[key] : 0), FNR, $0 }' "$RECENT" - <<< "$1" |
         sort -t$'\t' -k1,1n -k2,2n -k3,3n | cut -f4-
 }
@@ -1209,17 +1403,20 @@ open_url() {
 
 say() { notify-send -a ado "$@"; }
 
-# pick_menu PROMPT: choose one line of stdin in fuzzel and print its index (fails when you close it)
+# pick_menu PROMPT [MESSAGE]: choose one line of stdin in fuzzel and print its index (fails when you close it);
+# MESSAGE is shown above the list
 pick_menu() {
-    local lines
+    local lines width=60 args=()
     lines=$(cat)
-    fuzzel --dmenu --index --prompt "$1> " --width 60 --lines "$(wc -l <<< "$lines")" <<< "$lines"
+    [ -n "${2:-}" ] && { args=(--mesg "$2"); width=110; }
+    fuzzel --dmenu --index --prompt "$1> " --width "$width" --lines "$(wc -l <<< "$lines")" "${args[@]}" <<< "$lines"
 }
 
-# confirm_menu QUESTION: a yes/no in fuzzel, with No first so that a stray Enter does nothing
+# confirm_menu QUESTION [MESSAGE]: a yes/no in fuzzel (MESSAGE above it), with No first so that a stray Enter does nothing
 confirm_menu() {
-    local answer
-    answer=$(printf 'No\nYes\n' | fuzzel --dmenu --index --prompt "$1 " --width 100 --lines 2) || return 1
+    local answer args=()
+    [ -n "${2:-}" ] && args=(--mesg "$2")
+    answer=$(printf 'No\nYes\n' | fuzzel --dmenu --index --prompt "$1 " --width 100 --lines 2 "${args[@]}") || return 1
     [ "$answer" = 1 ]
 }
 
@@ -1244,18 +1441,35 @@ show_comments() {
     thread_actions "$id" "$url" "$(sed -n "$((choice + 1))p" <<< "$threads")"
 }
 
+# menu_new [PARENT]: make a work item: pick its type (a Task under PARENT when there is one) and type the title
+menu_new() {
+    local parent=${1:-} type choice title plan types=("Task" "Bug" "Product Backlog Item" "Dev Bug") args=()
+    if [ -n "$parent" ]; then
+        type=Task
+        args=(--parent "$parent")
+    else
+        choice=$(printf '%s\n' "${types[@]}" | pick_menu "new work item") || return 0
+        type=${types[$choice]}
+    fi
+    title=$(fuzzel --dmenu --lines 0 --prompt "$type> " --width 100 < /dev/null) || return 0
+    [ -n "$title" ] || return 0
+    plan=$("$SELF" new --type "$type" --title "$title" "${args[@]}" --plan 2>&1) || { say -u critical "ado: cannot make it" "$plan"; return; }
+    confirm_menu "Create $plan?" && run_action new --type "$type" --title "$title" "${args[@]}" --yes --open
+}
+
 # thread_actions NUMBER URL THREAD: what to do with one comment thread (THREAD is its JSON from pr_threads)
 thread_actions() {
-    local id=$1 url=$2 thread=$3 tid choice text
+    local id=$1 url=$2 thread=$3 tid choice text view
     tid=$(jq -r .id <<< "$thread")
-    choice=$(printf '%s\n' "Open" "Reply" "Resolve" "Close as won't fix" "Copy text" | pick_menu "thread #$tid") || return 0
+    view=$(thread_view <<< "$thread")      # the whole conversation stays on screen above every question below
+    choice=$(printf '%s\n' "Open" "Reply" "Resolve" "Close as won't fix" "Copy text" | pick_menu "thread #$tid" "$view") || return 0
     case $choice in
         0) open_url "$url?discussionId=$tid" ;;
-        1) text=$(fuzzel --dmenu --lines 0 --prompt "reply to #$tid> " --width 100 < /dev/null) || return 0
-           [ -n "$text" ] && confirm_menu "Post this reply on #$tid: ${text:0:60}?" && run_action reply "$id" "$tid" "$text" ;;
-        2) confirm_menu "Resolve thread #$tid?" && run_action resolve "$id" "$tid" ;;
-        3) confirm_menu "Close thread #$tid as won't fix?" && run_action resolve "$id" "$tid" --wontfix ;;
-        4) jq -r .text <<< "$thread" | wl-copy; say "ado" "comment copied" ;;
+        1) text=$(fuzzel --dmenu --lines 0 --mesg "$view" --prompt "reply #$tid> " --width 110 < /dev/null) || return 0
+           [ -n "$text" ] && confirm_menu "Post this reply?" "$view"$'\n\n'"you:"$'\n'"  $text" && run_action reply "$id" "$tid" "$text" ;;
+        2) confirm_menu "Resolve thread #$tid?" "$view" && run_action resolve "$id" "$tid" ;;
+        3) confirm_menu "Close thread #$tid as won't fix?" "$view" && run_action resolve "$id" "$tid" --wontfix ;;
+        4) jq -r '[.comments[] | "\(.author):\n\(.text)"] | join("\n\n")' <<< "$thread" | wl-copy; say "ado" "thread copied" ;;
     esac
 }
 
@@ -1269,8 +1483,8 @@ menu_actions() {
                  keys+=(comments complete uncomplete link checkout) ;;
         run)     labels+=("Run it again" "Copy link")
                  keys+=(rerun link) ;;
-        item)    labels+=("Start work" "Create pull request" "Create a branch" "Change state" "Copy number" "Copy link")
-                 keys+=(start newpr branch state number link) ;;
+        item)    labels+=("Start work" "Add task" "Create pull request" "Create a branch" "Change state" "Copy number" "Copy link")
+                 keys+=(start addtask newpr branch state number link) ;;
         *)       open_url "$url"; return ;;
     esac
     choice=$(printf '%s\n' "${labels[@]}" | pick_menu "actions") || return 0
@@ -1288,6 +1502,7 @@ menu_actions() {
         newpr)
             plan=$("$SELF" pr --item "$ref" --plan 2>&1) || { say -u critical "ado: no pull request" "$plan"; return; }
             confirm_menu "Create pull request: $plan?" && run_action pr --item "$ref" --yes --open ;;
+        addtask)  menu_new "$ref" ;;
         start)
             plan=$("$SELF" start "$ref" --plan 2>&1) || { say -u critical "ado: cannot start" "$plan"; return; }
             confirm_menu "Start work on $ref: $plan?" && run_action start "$ref" --yes ;;
@@ -1305,10 +1520,11 @@ menu_actions() {
 }
 
 cmd_menu() {
-    local entries choice status url kind ref mode="" print=0 raw=0 arg query=""
+    local entries choice url kind ref mode="" print=0 raw=0 arg query=""
     for arg in "$@"; do
         case $arg in
             items)   mode=items ;;
+            sprint)  mode=sprint ;;
             search)  mode=search ;;
             --print) print=1 ;;
             --raw)   print=1; raw=1 ;;
@@ -1333,6 +1549,8 @@ cmd_menu() {
         fi
         entries=$(search_entries "$query") || exit 1
         [ -n "$entries" ] || entries=$'about:blank\tno work item found for: '"$query"
+    elif [ "$mode" = sprint ]; then
+        entries=$(sprint_entries) || exit 1
     else
         entries=$(menu_entries "$mode") || exit 1
         entries=$(reorder_recent "$entries")
@@ -1343,24 +1561,22 @@ cmd_menu() {
         return
     fi
 
-    # Enter asks what to do with the entry (Open is the first action); Alt+1 (fuzzel's custom-1: exit status 10)
-    # opens it at once
-    choice=$(cut -f2 <<< "$entries" | fuzzel --dmenu --index --prompt 'devops (Alt+1: open)> ' --width 100 --lines 12)
-    status=$?
-    case $status in 0|10) ;; *) exit 0 ;; esac
+    # Enter asks what to do with the entry (Open is the first action)
+    choice=$(cut -f2 <<< "$entries" | fuzzel --dmenu --index --prompt 'devops> ' --width 100 --lines 12) || exit 0
     IFS=$'\t' read -r url _ kind ref <<< "$(sed -n "$((choice + 1))p" <<< "$entries")"
     [ "$url" = about:blank ] && exit 0
     [ "$kind" = search ] && exec "$SELF" menu search
+    [ "$kind" = sprint ] && exec "$SELF" menu sprint
+    if [ "$kind" = new ]; then
+        menu_new
+        exit 0
+    fi
     if [ "$kind" = undo ]; then
         confirm_menu "Undo: $(undo_info)?" && run_action undo --yes
         exit 0
     fi
     record_recent "$kind" "$ref"
-    if [ "$status" = 10 ]; then
-        open_url "$url"
-    else
-        menu_actions "$kind" "$ref" "$url"
-    fi
+    menu_actions "$kind" "$ref" "$url"
 }
 
 # --- refresh, notifications -------------------------------------------------------------------------
@@ -1470,12 +1686,14 @@ command=${1:-}
 
 case $command in
     ""|-h|--help|help) usage; exit 0 ;;
-    prs|runs|items|item|branch|start|pr|vote|comments|reply|resolve|complete|checkout|rerun|state|undo|menu|refresh|status) ;;
+    prs|runs|items|item|branch|sprint|new|start|pr|vote|comments|reply|resolve|complete|checkout|rerun|state|undo|menu|refresh|status) ;;
     *) die "unknown command '$command' (ado --help)" ;;
 esac
 
 load_config
 case $command in
+    sprint)   cmd_sprint "$@" ;;
+    new)      cmd_new "$@" ;;
     start)    cmd_start "$@" ;;
     pr)       cmd_pr "$@" ;;
     reply)    cmd_reply "$@" ;;
