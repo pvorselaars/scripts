@@ -1,33 +1,54 @@
 #!/bin/bash
-# notification-history: browse the notifications mako has dismissed or let expire, in fuzzel.
-# The newest is first. Picking one copies its text (summary and body) to the clipboard.
+# notification-history: browse the notifications mako has dismissed or let expire, in fuzzel. The newest is first.
+# A notification that is about a page (ado's: a failed run, a review that is asked, ...) is marked with an arrow, and
+# picking it opens that page in Firefox; picking any other copies its text (summary and body) to the clipboard.
 #
-#   notification-history            pick one and copy it
+#   notification-history            pick one
 #   notification-history --print    list the entries without showing the menu
 #
+# The page is kept in the category of the notification ("url:https://..."), which is all that mako keeps of it.
 # mako keeps the history only while it runs, and not longer than max-history in its config (default 5).
 
 menu() { fuzzel --dmenu --index --prompt 'notifications> ' --width 100 --lines 12; }
 
-# entries: one JSON object per notification, the newest first, with the one line label for the menu
+# open_page URL: open it in Firefox and bring that window to the front (sway does not let a new tab take the focus by
+# itself, so the page would open out of sight)
+open_page() {
+    setsid firefox "$1" >/dev/null 2>&1 &
+    sleep 0.4
+    swaymsg '[app_id="org.mozilla.firefox"] focus' >/dev/null 2>&1
+}
+
+# entries: one JSON object per notification, the newest first, with its page (url, empty when it has none) and the
+# one line label for the menu
 entries() {
     makoctl history -j | jq -c '
         sort_by(.id) | reverse | .[]
         | .body = (.body // "") | .summary = (.summary // "")
-        | .label = "\(.app_name // "-" | .[0:12] | . + (" " * (12 - length)))  \(.summary)\(if .body != "" then "  -  " + (.body | gsub("\n"; " ")) else "" end)"'
+        | .url = (((.category // "") | capture("(^|,)url:(?<url>[^,]+)")? | .url) // "")
+        | .label = "\(if .url != "" then "↗ " else "  " end)\(.app_name // "-" | .[0:12] | . + (" " * (12 - length)))  \(.summary)\(if .body != "" then "  -  " + (.body | gsub("\n"; " ")) else "" end)"'
 }
 
 list=$(entries) || { echo "notification-history: makoctl history failed (is mako running?)" >&2; exit 1; }
-[ -n "$list" ] || list=$(jq -nc '{label: "no notifications in the history", empty: true}')
+if [ -z "$list" ]; then
+    list=$(jq -nc '{label: "no notifications in the history", empty: true, url: ""}')
+fi
 
-if [ "$1" = --print ]; then
+if [ "${1:-}" = --print ]; then
     jq -r .label <<< "$list"
     exit 0
 fi
 
 choice=$(jq -r .label <<< "$list" | menu) || exit 0
 picked=$(sed -n "$((choice + 1))p" <<< "$list")
-[ "$(jq -r '.empty // false' <<< "$picked")" = true ] && exit 0
+if [ "$(jq -r '.empty // false' <<< "$picked")" = true ]; then
+    exit 0
+fi
 
-jq -j '.summary, (if .body != "" then "\n" + .body else "" end)' <<< "$picked" | wl-copy
-notify-send -a notifications -t 1500 "Copied" "$(jq -r .summary <<< "$picked")"
+url=$(jq -r .url <<< "$picked")
+if [ -n "$url" ]; then
+    open_page "$url"
+else
+    jq -j '.summary, (if .body != "" then "\n" + .body else "" end)' <<< "$picked" | wl-copy
+    notify-send -a notifications -t 1500 "Copied" "$(jq -r .summary <<< "$picked")"
+fi
