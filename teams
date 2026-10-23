@@ -1,0 +1,255 @@
+#!/bin/bash
+# teams: a first, small Teams client for the terminal, on the Microsoft Graph API (curl + jq).
+#
+#   teams login             sign in (device code flow)
+#   teams chats             your chats, newest first; * marks a chat with unread messages
+#   teams unread            the number of chats with unread messages (for the status bar)
+#   teams read N [COUNT]    the last COUNT messages (default 15) of chat number N from `teams chats`
+#   teams send N TEXT...    send a message to chat number N
+#   teams logout            forget the sign-in
+#
+# Setup: register an app in Entra ID (a public client: "Allow public client flows" = yes) with the
+# delegated permissions User.Read and Chat.ReadWrite, and put its ids in ~/.config/teams/config:
+#   CLIENT_ID=...
+#   TENANT_ID=...
+# Whether your organisation lets you do this, and whether it allows the device code flow, is up to
+# its administrators. Try `GET /me/chats` in Graph Explorer first.
+#
+# The refresh token is kept in the keyring (secret-tool); access tokens are cached in $XDG_RUNTIME_DIR.
+# Overrides, mostly for testing: TEAMS_CONFIG, TEAMS_KEYRING_SERVICE, TEAMS_GRAPH, TEAMS_LOGIN_HOST.
+
+CONFIG=${TEAMS_CONFIG:-$HOME/.config/teams/config}
+KEYRING_SERVICE=${TEAMS_KEYRING_SERVICE:-teams}
+CACHE=${XDG_RUNTIME_DIR:-/tmp}/teams
+GRAPH=${TEAMS_GRAPH:-https://graph.microsoft.com/v1.0}
+LOGIN_HOST=${TEAMS_LOGIN_HOST:-https://login.microsoftonline.com}
+SCOPE="offline_access User.Read Chat.ReadWrite"
+
+die() { echo "teams: $*" >&2; exit 1; }
+
+# the comment block at the top of this file, without the "# "
+usage() { sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//'; }
+
+# --- configuration and sign-in ---------------------------------------------------------------------
+
+# a value from the config file ("NAME=value" lines; the file is read, not run)
+config_value() { sed -n "s/^$1=//p" "$CONFIG" | head -n 1; }
+
+load_config() {
+    [ -r "$CONFIG" ] || die "no $CONFIG (see the top of this script for the setup)"
+    CLIENT_ID=$(config_value CLIENT_ID)
+    TENANT_ID=$(config_value TENANT_ID)
+    [ -n "$CLIENT_ID" ] && [ -n "$TENANT_ID" ] || die "CLIENT_ID and TENANT_ID must be set in $CONFIG"
+    AUTH="$LOGIN_HOST/$TENANT_ID/oauth2/v2.0"
+}
+
+# the error text of a response from the login service
+login_error() { jq -r '.error_description // .error // "unknown error"' <<< "$1" | head -n 1; }
+
+# save_tokens JSON: keep the refresh token in the keyring and the access token in the cache
+save_tokens() {
+    local json=$1 refresh
+    refresh=$(jq -r '.refresh_token // empty' <<< "$json")
+    if [ -n "$refresh" ]; then
+        printf '%s' "$refresh" |
+            secret-tool store --label="Teams refresh token" service "$KEYRING_SERVICE" name refresh_token
+    fi
+    mkdir -p "$CACHE"
+    chmod 700 "$CACHE"
+    {
+        echo $(( $(date +%s) + $(jq -r '.expires_in // 3600' <<< "$json") - 60 ))   # when it stops being valid
+        jq -r '.access_token' <<< "$json"
+    } > "$CACHE/access"
+    chmod 600 "$CACHE/access"
+}
+
+login() {
+    local response device_code interval json error
+    response=$(curl -sS -X POST "$AUTH/devicecode" -d client_id="$CLIENT_ID" --data-urlencode "scope=$SCOPE") \
+        || die "could not reach the login service"
+    device_code=$(jq -r '.device_code // empty' <<< "$response")
+    [ -n "$device_code" ] || die "could not start the sign-in: $(login_error "$response")"
+
+    jq -r '.message' <<< "$response"        # "To sign in, open <page> and enter the code <code>"
+    interval=$(jq -r '.interval // 5' <<< "$response")
+
+    while sleep "$interval"; do
+        json=$(curl -sS -X POST "$AUTH/token" -d grant_type=urn:ietf:params:oauth:grant-type:device_code \
+            -d client_id="$CLIENT_ID" -d device_code="$device_code") || die "could not reach the login service"
+        if jq -e '.access_token' >/dev/null <<< "$json"; then
+            save_tokens "$json"
+            echo "signed in"
+            return
+        fi
+        error=$(jq -r '.error // empty' <<< "$json")
+        case $error in
+            authorization_pending) ;;                       # not done in the browser yet
+            slow_down) interval=$((interval + 5)) ;;
+            *) die "sign-in failed: $(login_error "$json")" ;;
+        esac
+    done
+}
+
+# access_token: a valid access token, refreshed with the refresh token when the cached one has run out
+access_token() {
+    local expires token refresh json
+    if [ -r "$CACHE/access" ]; then
+        { read -r expires; read -r token; } < "$CACHE/access"
+        if [ "$expires" -gt "$(date +%s)" ]; then
+            echo "$token"
+            return
+        fi
+    fi
+
+    refresh=$(secret-tool lookup service "$KEYRING_SERVICE" name refresh_token 2>/dev/null)
+    [ -n "$refresh" ] || die "not signed in: run teams login"
+    json=$(curl -sS -X POST "$AUTH/token" -d grant_type=refresh_token -d client_id="$CLIENT_ID" \
+        --data-urlencode "refresh_token=$refresh" --data-urlencode "scope=$SCOPE") \
+        || die "could not reach the login service"
+    jq -e '.access_token' >/dev/null <<< "$json" || die "the sign-in has expired, run teams login ($(login_error "$json"))"
+    save_tokens "$json"
+    jq -r '.access_token' <<< "$json"
+}
+
+# --- Graph ---------------------------------------------------------------------------------------
+
+# graph METHOD PATH [JSON]: call Graph and print the JSON; on an error print Graph's message and fail
+graph() {
+    local method=$1 path=$2 body=${3:-} token response status
+    local args=()
+    token=$(access_token) || return 1
+    [ -n "$body" ] && args+=(-H "Content-Type: application/json" -d "$body")
+
+    response=$(curl -sS -X "$method" "$GRAPH$path" -H "Authorization: Bearer $token" "${args[@]}" \
+        -w $'\n%{http_code}') || { echo "teams: could not reach Graph" >&2; return 1; }
+    status=${response##*$'\n'}
+    response=${response%$'\n'*}
+
+    if [ "$status" -ge 400 ]; then
+        echo "teams: Graph answered $status: $(jq -r '.error.message // empty' <<< "$response" 2>/dev/null)" >&2
+        return 1
+    fi
+    echo "$response"
+}
+
+# the text of a Teams message body (HTML) without tags and entities
+html_to_text() {
+    sed -e 's/<br[^>]*>/\n/g' -e 's/<\/p>/\n/g' -e 's/<[^>]*>//g' \
+        -e 's/&nbsp;/ /g' -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&quot;/"/g' -e "s/&#39;/'/g" -e 's/&amp;/\&/g'
+}
+
+# time_of ISO_TIMESTAMP: the local time as HH:MM
+time_of() { date -d "$1" +%H:%M 2>/dev/null || echo "--:--"; }
+
+# fetch_chats: save your chats, newest first, in $CACHE/chats.json
+fetch_chats() {
+    local me chats
+    me=$(graph GET '/me?$select=id') || return 1
+    chats=$(graph GET '/me/chats?$expand=members,lastMessagePreview&$top=50') || return 1
+    mkdir -p "$CACHE"
+    # a chat is unread when its last message is newer than the last one you read
+    jq --arg me "$(jq -r '.id' <<< "$me")" '
+        [ .value[] | {
+            id,
+            label: (.topic // ([.members[]? | select(.userId != $me) | .displayName] | join(", "))),
+            time: (.lastMessagePreview.createdDateTime // ""),
+            read: (.viewpoint.lastMessageReadDateTime // ""),
+            from: (.lastMessagePreview.from.user.displayName // ""),
+            preview: ((.lastMessagePreview.body.content // "") | gsub("[\\n\\t\\r]"; " "))
+          } | .unread = (.time > .read) ]
+        | sort_by(.time) | reverse' <<< "$chats" > "$CACHE/chats.json"
+}
+
+# chat_id N: the id of chat number N in the last list (fetching the list when there is none yet)
+chat_id() {
+    local number=$1 id
+    [[ $number =~ ^[0-9]+$ ]] || die "give a chat number from teams chats"
+    [ -f "$CACHE/chats.json" ] || fetch_chats || exit 1
+    id=$(jq -r --argjson n "$number" '.[$n - 1].id // empty' "$CACHE/chats.json")
+    [ -n "$id" ] || die "there is no chat number $number"
+    echo "$id"
+}
+
+# --- commands --------------------------------------------------------------------------------------
+
+cmd_chats() {
+    local n=0 unread label from time preview mark
+    fetch_chats || exit 1
+    # fields are separated by \x1f, not a tab: read drops empty fields between tabs, and `from` can be empty
+    while IFS=$'\x1f' read -r unread label from time preview; do
+        n=$((n + 1))
+        mark=" "; [ "$unread" = true ] && mark="*"
+        preview=$(html_to_text <<< "$preview")
+        [ -n "$from" ] && preview="$from: $preview"
+        printf '%s %2d  %-28.28s  %s  %s\n' "$mark" "$n" "${label:-(no name)}" "$(time_of "$time")" "${preview:0:60}"
+    done < <(jq -r '.[] | [.unread, .label, .from, .time, .preview] | map(tostring) | join("\u001f")' "$CACHE/chats.json")
+}
+
+cmd_unread() {
+    fetch_chats || exit 1
+    jq '[.[] | select(.unread)] | length' "$CACHE/chats.json"
+}
+
+cmd_read() {
+    local id messages time sender type deleted content text
+    id=$(chat_id "$1") || exit 1
+    messages=$(graph GET "/chats/$id/messages?\$top=${2:-15}") || exit 1
+
+    # one line per message, fields separated by \x1f; the content is base64 so that its line breaks
+    # and tabs cannot break the line
+    while IFS=$'\x1f' read -r time sender type deleted content; do
+        if [ "$deleted" = true ]; then
+            text="(deleted)"
+        elif [ "$type" != message ]; then
+            text="· $type"
+        else
+            text=$(base64 -d <<< "$content" | html_to_text)
+        fi
+        printf '[%s] %s: %s\n' "$(time_of "$time")" "$sender" "${text//$'\n'/$'\n         '}"
+    done < <(jq -r '.value | reverse | .[] | [
+        .createdDateTime,
+        (.from.user.displayName // .from.application.displayName // "system"),
+        .messageType,
+        (.deletedDateTime != null),
+        ((.body.content // "") | @base64)
+    ] | map(tostring) | join("\u001f")' <<< "$messages")
+}
+
+cmd_send() {
+    local id text payload
+    id=$(chat_id "$1") || exit 1
+    shift
+    text=$*
+    [ -n "$text" ] || die "usage: teams send N TEXT..."
+    payload=$(jq -n --arg text "$text" '{body: {content: $text}}')
+    graph POST "/chats/$id/messages" "$payload" >/dev/null || exit 1
+    echo "sent"
+}
+
+cmd_logout() {
+    secret-tool clear service "$KEYRING_SERVICE" name refresh_token
+    rm -rf "$CACHE"
+    echo "signed out"
+}
+
+# --- main ------------------------------------------------------------------------------------------
+
+command=${1:-}
+[ $# -gt 0 ] && shift
+
+case $command in
+    ""|-h|--help|help) usage; exit 0 ;;
+    login|chats|unread|read|send|logout) ;;
+    *) die "unknown command '$command' (teams --help)" ;;
+esac
+
+load_config
+case $command in
+    login)  login ;;
+    chats)  cmd_chats ;;
+    unread) cmd_unread ;;
+    read)   [ $# -ge 1 ] || die "usage: teams read N [COUNT]"; cmd_read "$@" ;;
+    send)   [ $# -ge 2 ] || die "usage: teams send N TEXT..."; cmd_send "$@" ;;
+    logout) cmd_logout ;;
+    *) die "unknown command '$command' (teams --help)" ;;
+esac
