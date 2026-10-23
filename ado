@@ -56,7 +56,10 @@
 #   ado refresh              look everything up and store the counts for the status bar (a timer does this every
 #                            five minutes), and send a notification for what is new since the last time: a
 #                            review that is asked, a failed run, a vote or a comment on a pull request of yours,
-#                            and a review or pull request that has been waiting too long (once each)
+#                            and a review or pull request that has been waiting too long (once each); clicking
+#                            a notification opens the build or the pull request it is about
+#   ado notify URGENCY TITLE TEXT [URL]  show a notification that opens URL in Firefox when you click it (what
+#                            refresh uses; URGENCY is low, normal or critical)
 #   ado status               print the stored counts: REVIEW FAILED (or "login" when az needs a new sign-in)
 #
 # ado branch ID [--repo PROJECT/REPO] [--from BRANCH] [--name NAME] [--prefix PREFIX] [--link] [--checkout]
@@ -90,6 +93,8 @@
 #   ADO_PICKER=list|fzf      force the numbered list or fzf when a work item has to be picked
 #   ADO_DRY_RUN=1            vote, rerun, state, branch, pr, complete, reply, resolve and new print what they would
 #                            send, and change nothing
+#   ADO_NO_SYSTEMD=1         refresh keeps a notification that waits for a click as a background job, not as a
+#                            service of your session (for tests)
 # `ado menu --print` lists the entries without the menu (--raw: with their url, kind and number).
 
 CONFIG=${ADO_CONFIG:-$HOME/.config/ado/config}
@@ -1764,7 +1769,8 @@ cmd_menu() {
 #   review: the pull requests waiting for you         failed: the runs that need you
 #   mine:   your own pull requests, with their votes and open comments
 #   nudge:  what has been waiting too long: a review for NUDGE_REVIEW_HOURS, a pull request of yours without any
-#           vote for NUDGE_PR_DAYS (the key says which one, the value what to tell you)
+#           vote for NUDGE_PR_DAYS (the key says which one, the value is {text: what to tell you, url})
+# Everything has its url, for the notifications.
 refresh_snapshot() {
     jq -n --argjson now "$(date +%s)" --argjson hours "$NUDGE_REVIEW_HOURS" --argjson days "$NUDGE_PR_DAYS" \
           --argjson comments "$3" --slurpfile prs <(echo "$1") --slurpfile runs <(echo "$2") '
@@ -1772,46 +1778,74 @@ refresh_snapshot() {
         def age: (sub("\\.[0-9]+"; "") | fromdateiso8601) as $created | $now - $created;
         {
             taken: $now,
-            review: ([$prs[] | select(.waiting) | {key: (.id | tostring), value: {title, author, age: (.created | age)}}] | from_entries),
-            failed: ([$runs[] | select(.attention) | {key: (.id | tostring), value: {name, branch, number}}] | from_entries),
+            review: ([$prs[] | select(.waiting) | {key: (.id | tostring), value: {title, author, url, age: (.created | age)}}] | from_entries),
+            failed: ([$runs[] | select(.attention) | {key: (.id | tostring), value: {name, branch, number, url}}] | from_entries),
             mine:   ([$prs[] | select(.mine) | {key: (.id | tostring), value: {
-                          title, draft: .draft, age: (.created | age),
+                          title, url, draft: .draft, age: (.created | age),
                           votes: (.votes | map({key: (.name | vname), value: .vote}) | from_entries),
                           comments: ($comments[.id | tostring] // 0)}}] | from_entries)
         }
         | .nudge = ([(.review | to_entries[] | select(.value.age >= $hours * 3600)
-                      | {key: "review-\(.key)", value: "waiting \(.value.age / 3600 | floor)h for your review: !\(.key)  \(.value.title)"}),
+                      | {key: "review-\(.key)", value: {url: .value.url,
+                                text: "waiting \(.value.age / 3600 | floor)h for your review: !\(.key)  \(.value.title)"}}),
                      (.mine | to_entries[] | select((.value.draft | not) and .value.age >= $days * 86400
                                                     and ([.value.votes[] | select(. != 0)] | length) == 0)
-                      | {key: "mine-\(.key)", value: "no review yet after \(.value.age / 86400 | floor)d: !\(.key)  \(.value.title)"})]
+                      | {key: "mine-\(.key)", value: {url: .value.url,
+                                text: "no review yet after \(.value.age / 86400 | floor)d: !\(.key)  \(.value.title)"}})]
                     | from_entries)'
 }
 
-# refresh_events OLD NEW: what is new in the snapshot NEW since the snapshot OLD, one "urgency TAB title TAB text"
-# line each: a review that was asked, a failed run, a vote or a comment on a pull request of yours, a nudge
+# refresh_events OLD NEW: what is new in the snapshot NEW since the snapshot OLD, one "urgency TAB title TAB text TAB url"
+# line each: a review that was asked, a failed run, a vote or a comment on a pull request of yours, a nudge.
+# The fourth field is the page the notification is about.
 refresh_events() {
     jq -r --argjson old "$1" '
         def vtext: if . == 10 then "approved" elif . == 5 then "approved with suggestions"
                    elif . == -5 then "is waiting for the author" else "rejected" end;
         . as $new
         | ($new.review | to_entries[] | select($old.review[.key] == null)
-           | "normal\tReview asked\t!\(.key)  \(.value.title)  (\(.value.author))"),
+           | "normal\tReview asked\t!\(.key)  \(.value.title)  (\(.value.author))\t\(.value.url)"),
           ($new.failed | to_entries[] | select($old.failed[.key] == null)
-           | "critical\tRun failed\t\(.value.name)  \(.value.branch)  #\(.value.number)"),
+           | "critical\tRun failed\t\(.value.name)  \(.value.branch)  #\(.value.number)\t\(.value.url)"),
           ($new.mine | to_entries[] | .key as $id | .value as $now | $old.mine[$id] as $then | select($then != null)
            | (($now.votes | to_entries[] | select(.value != 0 and ($then.votes[.key] // 0) != .value)
-               | "\(if .value < 0 then "critical" else "normal" end)\t\(.key) \(.value | vtext)\t!\($id)  \($now.title)"),
-              (select($now.comments > $then.comments) | "normal\tNew comment\t!\($id)  \($now.title)"))),
-          ($new.nudge | to_entries[] | select($old.nudge[.key] == null) | "low\tStill waiting\t\(.value)")' <<< "$2"
+               | "\(if .value < 0 then "critical" else "normal" end)\t\(.key) \(.value | vtext)\t!\($id)  \($now.title)\t\($now.url)"),
+              (select($now.comments > $then.comments) | "normal\tNew comment\t!\($id)  \($now.title)\t\($now.url)"))),
+          ($new.nudge | to_entries[] | select($old.nudge[.key] == null) | "low\tStill waiting\t\(.value.text)\t\(.value.url)")' <<< "$2"
 }
 
 # notify_events OLD NEW: show what refresh_events finds as notifications (not with NOTIFY=0 in the config)
 notify_events() {
-    local urgency title text
+    local urgency title text url
     if [ "$NOTIFY" = 0 ]; then return; fi
-    refresh_events "$1" "$2" | while IFS=$'\t' read -r urgency title text; do
-        notify-send -a ado -u "$urgency" "$title" "$text"
+    refresh_events "$1" "$2" | while IFS=$'\t' read -r urgency title text url; do
+        notify_one "$urgency" "$title" "$text" "$url"
     done
+}
+
+# notify_one URGENCY TITLE TEXT URL: show a notification that opens URL when you click it. Something has to wait for
+# the click, and the refresh is over long before that: it is a transient service of your session (when there is
+# systemd, and ADO_NO_SYSTEMD is not set), else a background job.
+notify_one() {
+    if [ -z "${ADO_NO_SYSTEMD:-}" ] && systemd-run --user --quiet --collect -- "$SELF" notify "$1" "$2" "$3" "$4" 2>/dev/null; then
+        return
+    fi
+    setsid "$SELF" notify "$1" "$2" "$3" "$4" >/dev/null 2>&1 &
+}
+
+# cmd_notify URGENCY TITLE TEXT [URL]: show a notification, and open URL in Firefox when you click it (this waits until
+# the notification is closed)
+cmd_notify() {
+    local answer
+    if [ $# -lt 3 ]; then die "usage: ado notify URGENCY TITLE TEXT [URL]"; fi
+    if [ -z "${4:-}" ]; then
+        notify-send -a ado -u "$1" "$2" "$3"
+        return
+    fi
+    answer=$(notify-send -a ado -u "$1" -A "default=Open" "$2" "$3") || return 0
+    if [ "$answer" = default ]; then
+        open_url "$4"
+    fi
 }
 
 # open_comments PRS: the open comment threads on your own pull requests (PRS: the lines of pull_requests), as JSON:
@@ -1873,12 +1907,13 @@ if [ $# -gt 0 ]; then shift; fi
 
 case $command in
     ""|-h|--help|help) usage; exit 0 ;;
-    prs|runs|items|item|branch|sprint|new|start|pr|vote|comments|reply|resolve|complete|checkout|rerun|state|undo|menu|refresh|status) ;;
+    prs|runs|items|item|branch|sprint|new|start|pr|vote|comments|reply|resolve|complete|checkout|rerun|state|undo|menu|refresh|notify|status) ;;
     *) die "unknown command '$command' (ado --help)" ;;
 esac
 
 load_config
 case $command in
+    notify)   cmd_notify "$@" ;;
     sprint)   cmd_sprint "$@" ;;
     new)      cmd_new "$@" ;;
     start)    cmd_start "$@" ;;
