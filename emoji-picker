@@ -3,8 +3,19 @@
 # The list is the full emoji list if the unicode-emoji package is installed (emoji-test.txt), followed by
 # the symbols of a few Unicode blocks (arrows, math, currency, Greek, ...), named after UnicodeData.txt.
 # `emoji-picker --print` lists the entries instead.
+# The menu is rofi, because fuzzel cannot draw colour emoji (the font is COLRv1); without rofi it is fuzzel.
 EMOJI_TEST=${EMOJI_TEST:-/usr/share/unicode/emoji/emoji-test.txt}
 UNICODE_DATA=${UNICODE_DATA:-/usr/share/unicode/ucd/UnicodeData.txt}
+
+# menu PROMPT: choose one line of stdin (rofi in the One Dark theme, as wide and as high as the fuzzel menus here)
+menu() {
+    if command -v rofi >/dev/null; then
+        rofi -dmenu -i -no-custom -matching fuzzy -p "$1" -theme "$HOME/.config/rofi/onedark.rasi" \
+            -theme-str 'window {width: 60ch;} listview {lines: 12;}'
+    else
+        fuzzel --dmenu --prompt "$1 " --width 60 --lines 12
+    fi
+}
 
 # list: one "character  name" line per entry, each character once
 list() {
@@ -66,7 +77,7 @@ if [ "$1" = --print ]; then
     exit 0
 fi
 
-choice=$(list | fuzzel --dmenu --prompt 'emoji> ' --width 60 --lines 12) || exit 0
+choice=$(list | menu 'emoji>') || exit 0
 char=${choice%%  *}
 printf '%s' "$char" | wl-copy
 notify-send -a emoji -t 1500 "Copied $char"
