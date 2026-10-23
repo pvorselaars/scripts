@@ -7,8 +7,10 @@
 #                            a failure that needs you is marked ! (the newest run failed, and it is not a
 #                            validation build of somebody else's pull request)
 #   ado items [--all]        your work items that are being worked on (--all: every one that is not closed)
-#   ado item ID              one work item: state, iteration, description, and what it is linked to
-#   ado branch ID [options]  create a branch for a work item, e.g. feature/156438-short-title (see below)
+#   ado item [ID]            one work item: state, iteration, description, and what it is linked to
+#   ado branch [ID] [options] create a branch for a work item, e.g. feature/156438-short-title (see below)
+#                            Without an ID, item and branch let you pick one of your work items with fzf
+#                            (with a preview of the item; --all: every one that is not closed).
 #   ado menu [items]         pick a pull request or a failed run (or, with items, a work item) in fuzzel
 #                            and open it in Firefox
 #   ado refresh              look everything up and store the counts for the status bar
@@ -315,7 +317,53 @@ branch_slug() {
     echo "${slug:0:50}" | sed -E 's/-+$//'
 }
 
-# --- commands --------------------------------------------------------------------------------------
+# pick_item [--all]: choose one of your work items and print its number. fzf shows a preview of the item next
+# to the list; without fzf or without a terminal it is a numbered list. ADO_PICKER=list forces the list and
+# ADO_PICKER=fzf forces fzf. Status: 0 picked, 3 nothing picked, 1 an error.
+pick_item() {
+    local list choice n self status use_fzf=0
+    list=$(work_items "$1" | jq -r '"\(.id)\t\(.type | sub("Product Backlog Item"; "PBI"))  \(.state)  \(.iteration)  \(.title)"') || return 1
+    [ -n "$list" ] || { echo "ado: no work items assigned to you in these states (--all shows more)" >&2; return 1; }
+
+    # fzf when it is installed and there is a terminal for it, unless ADO_PICKER says otherwise
+    case ${ADO_PICKER:-auto} in
+        fzf)  use_fzf=1 ;;
+        list) ;;
+        *)    [ -t 0 ] && [ -t 2 ] && use_fzf=1 ;;
+    esac
+    command -v fzf >/dev/null || use_fzf=0
+
+    if [ "$use_fzf" = 1 ]; then
+        self=$(readlink -f "$0")
+        choice=$(fzf --delimiter '\t' --with-nth 2 --prompt 'work item> ' \
+            --preview "'$self' item {1}" --preview-window 'right,55%,wrap' <<< "$list")
+        status=$?
+        [ "$status" -eq 0 ] || return 3
+    else
+        cut -f2 <<< "$list" | nl -w2 -s'. ' >&2
+        read -r -p "Number: " n
+        [[ $n =~ ^[0-9]+$ ]] || return 3
+        choice=$(sed -n "${n}p" <<< "$list")
+    fi
+    [ -n "$choice" ] || return 3
+    echo "${choice%%$'\t'*}"
+}
+
+# resolve_item ID ALL: the work item number that was given, or else one picked from your work items.
+# Status like pick_item; callers do: id=$(resolve_item "$id" "$all"); case $? in 0) ;; 3) exit 0 ;; *) exit 1 ;; esac
+resolve_item() {
+    local id=$1 all=$2 picked status
+    if [ -z "$id" ]; then
+        picked=$(pick_item "$all")
+        status=$?
+        [ "$status" -eq 0 ] || return "$status"
+        id=$picked
+    fi
+    [[ $id =~ ^[0-9]+$ ]] || { echo "ado: a work item number is needed" >&2; return 1; }
+    echo "$id"
+}
+
+# --- commands--------------------------------------------------------------------------------------
 
 cmd_prs() {
     local data line mark via
@@ -361,8 +409,14 @@ cmd_items() {
 }
 
 cmd_item() {
-    local id=$1 json field text
-    [[ $id =~ ^[0-9]+$ ]] || die "usage: ado item ID"
+    local id="" all="" arg json field text
+    for arg in "$@"; do
+        case $arg in
+            --all) all=--all ;;
+            *)     id=$arg ;;
+        esac
+    done
+    id=$(resolve_item "$id" "$all"); case $? in 0) ;; 3) exit 0 ;; *) exit 1 ;; esac
     json=$(api "/_apis/wit/workitems/$id?\$expand=all&api-version=7.1") || exit 1
     jq -r --arg org "$ORG" '
         .fields as $f
@@ -389,9 +443,10 @@ cmd_item() {
 }
 
 cmd_branch() {
-    local id="" repo_arg="" from="" name="" prefix="" link=0 checkout=0 yes=0 dry=0
+    local id="" all="" repo_arg="" from="" name="" prefix="" link=0 checkout=0 yes=0 dry=0
     while [ $# -gt 0 ]; do
         case $1 in
+            --all)      all=--all ;;
             --repo)     repo_arg=$2; shift ;;
             --from)     from=$2; shift ;;
             --name)     name=$2; shift ;;
@@ -405,7 +460,7 @@ cmd_branch() {
         esac
         shift
     done
-    [[ $id =~ ^[0-9]+$ ]] || die "usage: ado branch ID [options] (ado --help)"
+    id=$(resolve_item "$id" "$all"); case $? in 0) ;; 3) exit 0 ;; *) exit 1 ;; esac
 
     local item type title where repo_spec project repo_name info repo_id project_id default_branch
     local base base_sha heads clash answer body response name_given=0

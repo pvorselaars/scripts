@@ -34,7 +34,7 @@ Most take `--print` to list what the menu would show.
 | `sloc FILE` | Count the lines that are not blank |
 | `prof`, `bench`, `bench-new` | Profiling and benchmarking; see `PROFILING.md` |
 | `bib-add` | Add a book to the bibliography by ISBN or by searching Open Library |
-| `ado` | Azure DevOps at a glance via `az login`: pull requests (also the ones a team of yours has to review), failed runs, your work items, and creating a branch for a work item |
+| `ado` | Azure DevOps at a glance via `az login`: pull requests (also the ones a team of yours has to review), failed runs, your work items, and creating a branch for a work item (pick the item with fzf when you give no number) |
 | `teams` | A small Teams client on Microsoft Graph: chats, unread, read, send. Needs an Entra app registration (see its header) |
 | `stow DIR` | Link every item of `DIR` into the current folder |
 
