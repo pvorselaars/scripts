@@ -40,6 +40,11 @@
 #                            the git commands)
 #   ado rerun [RUN_ID]       queue a run of a pipeline again on the same branch; without an id, pick one of
 #                            your failed runs (--yes skips the question)
+#   ado why [RUN_ID]         why a run failed, without opening its page: the task that failed, the errors noted for it,
+#                            the lines of its log that tell why and the last lines (--lines N, --full: the whole log of
+#                            the task, --window: in a terminal of its own, --fuzzel: as a list in fuzzel where a
+#                            picked line is copied); without an id, pick one of your failed runs (the only one
+#                            that failed is taken without asking)
 #   ado attach FILE          put a file (a screenshot, a GIF of a bug) on a work item (--item ID) or a pull request
 #                            (--pr NUMBER), with the picture in a comment, after --text if you give it (--yes, --plan)
 #   ado clone                the folder of your clone of the repo of the config (the folder you are in, CLONE, or one
@@ -1373,10 +1378,183 @@ cmd_checkout() {
     fi
 }
 
+# failed_run_list: your failed runs, one "ID TAB label" line each; fails (with a message) when none has failed
+failed_run_list() {
+    local prs list
+    prs=$(pull_requests) || return 1
+    list=$(annotate_runs "$(runs)" "$prs" | jq -r 'select(.attention) | "\(.id)\t\(.name)  \(.branch)  #\(.number)"') || return 1
+    if [ -z "$list" ]; then
+        echo "ado: none of your runs has failed" >&2
+        return 1
+    fi
+    echo "$list"
+}
+
+# pick_failed_run: pick one of your failed runs (fzf or a numbered list, see pick_from) and print its id.
+# Status like pick_from; it is 1 with a message when none of your runs has failed.
+pick_failed_run() {
+    local list
+    list=$(failed_run_list) || return 1
+    # with "auto", the only failed run is not asked about
+    if [ "${1:-}" = auto ] && [ "$(wc -l <<< "$list")" = 1 ]; then
+        cut -f1 <<< "$list"
+        return 0
+    fi
+    pick_from 'failed run' "$list"
+}
+
+# find_build ID: the run with that id, as "PATH TAB JSON": PATH is its project as it goes into a URL. Fails when none of
+# your projects has it.
+find_build() {
+    local project path build
+    for project in $PROJECTS; do
+        path=$(project_path "$project")
+        if build=$(api "/$path/_apis/build/builds/$1?api-version=7.1" 2>/dev/null); then
+            printf '%s\t%s\n' "$path" "$(jq -c . <<< "$build")"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# failed_tasks PATH ID: one JSON object per task of a run that failed, the first to fail first (the later ones are often
+# only what follows from it): {stage, job, task, log, issues}, issues being the error messages of the task. When no task
+# failed, the stages and jobs that did (an agent that went away, a cancelled run) are given the same way.
+failed_tasks() {
+    api "/$1/_apis/build/builds/$2/timeline?api-version=7.1" | jq -c '
+        .records as $all
+        | def up($r): [$r] + (if $r.parentId then up(first($all[] | select(.id == $r.parentId))) else [] end);
+        def describe($t): up($t) as $chain
+            | {stage: ($chain | map(select(.type == "Stage"))[0].name // ""), job: ($chain | map(select(.type == "Job"))[0].name // ""),
+               task: (if $t.type == "Task" then $t.name else "" end), log: ($t.log.id // null),
+               issues: [$t.issues[]? | select(.type == "error") | .message]};
+        ([$all[] | select(.type == "Task" and .result == "failed")] | sort_by(.startTime)) as $tasks
+        | (if ($tasks | length) > 0 then $tasks
+           else [$all[] | select(.result == "failed" and .type != "Checkpoint" and (.issues | length) > 0)] | sort_by(.startTime) end)[]
+        | describe(.)'
+}
+
+# log_text PATH ID LOG: the log of a task as plain text: without the time in front of each line and without colours
+log_text() {
+    api "/$1/_apis/build/builds/$2/logs/$3?api-version=7.1" |
+        sed -E 's/\r//g; s/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z //; s/\x1b\[[0-9;]*[A-Za-z]//g; s/^##\[error\]/error: /; s/^##\[warning\]/warning: /'
+}
+
+# telling_lines MAX: from a log on stdin the lines that say why something failed, as "NUMBER: line", the first MAX of
+# them (and "+N" when there are more): errors, failing tests, compiler errors, a threshold that is not met, ...
+telling_lines() {
+    gawk -v max="$1" '
+        /^##\[(section|group|endgroup|command|debug|warning)\]/ { next }
+        /^(PASS|ok) / { next }
+        { low = tolower($0) }
+        low ~ /##\[error\]|^fail |✕|✖|^error:|error ts[0-9]+|error cs[0-9]+|error msb[0-9]+|error nu[0-9]+|threshold|failed!|exception|npm err|build failed|assertionerror|cannot find|is not assignable|expected .* (to|but)|[0-9]+ failing|tests? failed|failed to / \
+            && low !~ /0 errors|0 failed|warning/ {
+            n++
+            if (n <= max) printf "%d: %s\n", NR, $0
+        }
+        END { if (n > max) printf "+%d\n", n - max }'
+}
+
+# why_summary ID: one line that says why run ID failed (the first telling line of the log that is not just "the command
+# failed"), for a notification. Nothing when it cannot be found.
+why_summary() {
+    local found path task line
+    found=$(find_build "$1") || return 0
+    path=${found%%$'\t'*}
+    task=$(failed_tasks "$path" "$1" 2>/dev/null | head -n 1)
+    if [ -z "$task" ] || [ "$(jq -r '.log // empty' <<< "$task")" = "" ]; then
+        return 0
+    fi
+    line=$(log_text "$path" "$1" "$(jq -r .log <<< "$task")" 2>/dev/null | telling_lines 40 |
+        gawk '!/^\+/ && tolower($0) !~ /npm failed with return code|process completed with exit code|exited with code|return code: [0-9]+$/' | head -n 1)
+    line=${line#*: }
+    echo "${line#\#\#\[error\]}" | cut -c1-140
+}
+
+# cmd_why [RUN_ID] [--lines N] [--full]: why a run failed, without opening its page: the task that failed (the first one,
+# when several did), the errors Azure DevOps noted for it, the lines of its log that tell why, and the last lines.
+# --lines N: how many of each (10), --full: the whole log of the task, --short: only one line that says why (for a
+# notification). Without an id, pick one of your failed runs.
+cmd_why() {
+    local id="" lines=10 full=0 short=0 window=0 view=0 found path build tasks task log count text first=1
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --lines)  lines=${2:-}; shift ;;
+            --full)   full=1 ;;
+            --short)  short=1 ;;
+            --window) window=1 ;;
+            --fuzzel) view=1 ;;
+            -*)       die "unknown option $1 (ado --help)" ;;
+            *)        id=$1 ;;
+        esac
+        shift
+    done
+    [[ $lines =~ ^[0-9]+$ ]] || die "--lines needs a number"
+    if [ "$view" = 1 ]; then
+        show_why "$id"
+        return
+    fi
+    if [ "$window" = 1 ]; then
+        # in a terminal window of its own (for a key binding or the menu): the picker of ado works in it, the text is
+        # paged, and an error (no run has failed, no sign-in) stays on the screen until a key is pressed
+        setsid foot --title "why a run failed" bash -c \
+            'echo "one moment ..."; out=$("$@"); if [ $? = 0 ]; then clear; printf "%s\n" "$out" | less -R; else printf "%s\n" "$out"; read -rsn1 -p "press a key to close "; fi' \
+            _ "$SELF" why ${id:+"$id"} >/dev/null 2>&1 &
+        return
+    fi
+    if [ "$short" = 1 ]; then
+        [[ $id =~ ^[0-9]+$ ]] || die "--short needs a run number"
+        why_summary "$id"
+        return
+    fi
+    if [ -z "$id" ]; then
+        id=$(pick_failed_run auto); exit_unless_picked $?
+    fi
+    [[ $id =~ ^[0-9]+$ ]] || die "a run number is needed (the id in the link of the run)"
+    found=$(find_build "$id") || die "there is no run $id in $PROJECTS"
+    path=${found%%$'\t'*}
+    build=${found#*$'\t'}
+    jq -r '"\(.definition.name) #\(.buildNumber)  \(.sourceBranch | sub("^refs/heads/"; ""))  \(.result // .status)"' <<< "$build"
+
+    tasks=$(failed_tasks "$path" "$id") || die "could not read the timeline of run $id"
+    if [ -z "$tasks" ]; then
+        echo "nothing in this run has failed"
+        return
+    fi
+    count=$(wc -l <<< "$tasks")
+    while IFS= read -r task; do
+        if [ "$first" = 1 ]; then
+            first=0
+            jq -r '"failed:  \([.stage, .job, .task] | map(select(. != "" and . != "__default")) | join(" > "))"' <<< "$task"
+            jq -r '.issues[] | "error:   " + .' <<< "$task"
+            log=$(jq -r '.log // empty' <<< "$task")
+            if [ -n "$log" ]; then
+                text=$(log_text "$path" "$id" "$log")
+                if [ "$full" = 1 ]; then
+                    echo
+                    echo "$text"
+                else
+                    echo
+                    echo "lines of the log that tell why:"
+                    telling_lines "$lines" <<< "$text" | sed -E 's/^\+([0-9]+)$/  (and \1 more: --lines or --full)/; s/^([0-9]+): /  \1: /'
+                    echo
+                    echo "the last lines:"
+                    gawk '!/^##\[(section|group|endgroup|command|debug)\]/ && NF' <<< "$text" | tail -n "$lines" | sed 's/^/  /'
+                fi
+            fi
+        else
+            jq -r '"also:    \([.stage, .job, .task] | map(select(. != "" and . != "__default")) | join(" > "))"' <<< "$task"
+        fi
+    done <<< "$tasks"
+    if [ "$count" -gt 1 ]; then
+        echo "(the first failure is shown; the others may follow from it)"
+    fi
+}
+
 # cmd_rerun [BUILD_ID] [--yes]: queue a run of the same pipeline on the same branch again; without an id, pick
 # one of your failed runs
 cmd_rerun() {
-    local id="" yes=0 arg list build project path name ref definition body response prs
+    local id="" yes=0 arg found build path name ref definition body response
     for arg in "$@"; do
         case $arg in
             --yes) yes=1 ;;
@@ -1385,22 +1563,13 @@ cmd_rerun() {
         esac
     done
     if [ -z "$id" ]; then
-        prs=$(pull_requests) || exit 1
-        list=$(annotate_runs "$(runs)" "$prs" | jq -r 'select(.attention) | "\(.id)\t\(.name)  \(.branch)  #\(.number)"') || exit 1
-        [ -n "$list" ] || die "none of your runs has failed"
-        id=$(pick_from 'failed run' "$list"); exit_unless_picked $?
+        id=$(pick_failed_run); exit_unless_picked $?
     fi
     [[ $id =~ ^[0-9]+$ ]] || die "a run number is needed (the id in the link of the run)"
 
-    build=""
-    for project in $PROJECTS; do
-        path=$(project_path "$project")
-        if build=$(api "/$path/_apis/build/builds/$id?api-version=7.1" 2>/dev/null); then
-            break
-        fi
-        build=""
-    done
-    [ -n "$build" ] || die "there is no run $id in $PROJECTS"
+    found=$(find_build "$id") || die "there is no run $id in $PROJECTS"
+    path=${found%%$'\t'*}
+    build=${found#*$'\t'}
     name=$(jq -r .definition.name <<< "$build")
     definition=$(jq -r .definition.id <<< "$build")
     ref=$(jq -r .sourceBranch <<< "$build")
@@ -1654,6 +1823,36 @@ run_action() {
     fi
 }
 
+# show_why [RUN_ID]: why a run failed, as a list in fuzzel (the run on top as the message, one line of the report per
+# entry); picking a line copies it, the first entry copies the whole report. Without an id, pick one of your failed runs
+# (the only one that failed is taken without asking).
+show_why() {
+    local id=${1:-} list choice report head body count
+    if [ -z "$id" ]; then
+        list=$(failed_run_list 2>&1) || { say -u critical "ado" "${list#ado: }"; return; }
+        if [ "$(wc -l <<< "$list")" = 1 ]; then
+            id=$(cut -f1 <<< "$list")
+        else
+            choice=$(cut -f2 <<< "$list" | pick_menu "failed run") || return 0
+            id=$(sed -n "$((choice + 1))p" <<< "$list" | cut -f1)
+        fi
+    fi
+    report=$("$SELF" why "$id" 2>&1) || { say -u critical "ado: why" "${report#ado: }"; return; }
+    head=$(head -n 1 <<< "$report")
+    body=$(tail -n +2 <<< "$report" | sed '/^$/d')
+    count=$(wc -l <<< "$body")
+    if [ "$count" -gt 24 ]; then count=24; fi
+    choice=$(printf '%s\n%s\n' "Copy the whole report" "$body" \
+        | fuzzel --dmenu --index --prompt "why> " --width 120 --lines "$((count + 1))" --mesg "$head") || return 0
+    if [ "$choice" = 0 ]; then
+        wl-copy <<< "$report"
+        say "ado" "report copied"
+    else
+        sed -n "${choice}p" <<< "$body" | sed -E 's/^ +([0-9]+: )?//' | wl-copy
+        say "ado" "line copied"
+    fi
+}
+
 # show_comments NUMBER URL: the open comment threads of a pull request in fuzzel; picking one opens it
 show_comments() {
     local id=$1 url=$2 pr threads list choice
@@ -1739,8 +1938,8 @@ menu_actions() {
                  keys+=(vote-approve vote-suggest vote-wait vote-reject vote-reset comments link checkout) ;;
         pr-mine) labels+=("Show open comments" "Set auto-complete" "Cancel auto-complete" "Copy link" "Copy checkout command")
                  keys+=(comments complete uncomplete link checkout) ;;
-        run)     labels+=("Run it again" "Copy link")
-                 keys+=(rerun link) ;;
+        run)     labels+=("Why it failed" "Run it again" "Copy link")
+                 keys+=(why rerun link) ;;
         item)    labels+=("Start work" "Add task" "Create pull request" "Create a branch" "Change state" "Copy number" "Copy link")
                  keys+=(start addtask newpr branch state number link) ;;
         *)       open_url "$url"; return ;;
@@ -1754,6 +1953,7 @@ menu_actions() {
         checkout)   wl-copy "$("$SELF" checkout "$ref" --print)"; say "ado" "checkout command copied" ;;
         comments)   show_comments "$ref" "$url" ;;
         vote-*)     confirm_run "${labels[$choice]} !$ref?" "" vote "$ref" "${key#vote-}" --yes ;;
+        why)        show_why "$ref" ;;
         rerun)      confirm_run "Run it again?" "" rerun "$ref" --yes ;;
         complete)   confirm_run "Complete !$ref by itself when it may (squash, delete the branch)?" "" complete "$ref" --yes ;;
         uncomplete) confirm_run "Cancel auto-complete of !$ref?" "" complete "$ref" --cancel --yes ;;
@@ -1901,9 +2101,16 @@ refresh_events() {
 
 # notify_events OLD NEW: show what refresh_events finds as notifications (not with NOTIFY=0 in the config)
 notify_events() {
-    local urgency title text url
+    local urgency title text url reason
     if [ "$NOTIFY" = 0 ]; then return; fi
     refresh_events "$1" "$2" | while IFS=$'\t' read -r urgency title text url; do
+        # a failed run says why in a line of its own (the run is in the address)
+        if [ "$title" = "Run failed" ] && [[ $url =~ buildId=([0-9]+) ]]; then
+            reason=$(why_summary "${BASH_REMATCH[1]}")
+            if [ -n "$reason" ]; then
+                text+=$'\n'"$reason"
+            fi
+        fi
         notify_one "$urgency" "$title" "$text" "$url"
     done
 }
@@ -1993,7 +2200,7 @@ if [ $# -gt 0 ]; then shift; fi
 
 case $command in
     ""|-h|--help|help) usage; exit 0 ;;
-    prs|runs|items|item|branch|sprint|new|start|pr|vote|comments|reply|resolve|complete|checkout|rerun|state|undo|menu|refresh|notify|attach|clone|status) ;;
+    prs|runs|items|item|branch|sprint|new|start|pr|vote|comments|reply|resolve|complete|checkout|rerun|state|undo|menu|refresh|notify|attach|clone|why|status) ;;
     *) die "unknown command '$command' (ado --help)" ;;
 esac
 
@@ -2002,6 +2209,7 @@ case $command in
     notify)   cmd_notify "$@" ;;
     attach)   cmd_attach "$@" ;;
     clone)    cmd_clone ;;
+    why)      cmd_why "$@" ;;
     sprint)   cmd_sprint "$@" ;;
     new)      cmd_new "$@" ;;
     start)    cmd_start "$@" ;;
