@@ -1,0 +1,169 @@
+#!/bin/bash
+# recurring: turn the rules in ~/Notes/recurring.md into todos with a deadline, for the days that are coming up.
+# A rule is one line, "cadence | text", outside code blocks:
+#     daily                 only today (so the list does not fill with a copy for every day)
+#     weekly DAY            every DAY (sunday, sun, zondag, zo, ...), Dutch or English
+#     monthly N | monthly last    the Nth day of the month (a shorter month uses its last day), or the last day
+#     quarterly N | quarterly last    the same, in January, April, July and October
+# In the text, YYYY-MM-DD becomes the day of the occurrence and YYYY-MM its month, so "[[review-YYYY-MM]]" links to the
+# note of that month. Each occurrence in the next 14 days becomes "- [ ] text [[date]]" (the deadline of the start page),
+# added under "## Coming up" at the end of recurring.md. Occurrences that are already in any note, ticked or not, are
+# skipped, so it can run as often as you like: to drop one occurrence, tick it.
+# Options: --days N (look ahead N days, default 14), --dry (show what would be added, change nothing).
+# A rule that cannot be read is reported and skipped, and the exit status is 1.
+# NOTES_DIR overrides the folder, RECURRING_TODAY=YYYY-MM-DD fixes "today" (for tests).
+dir=${NOTES_DIR:-$HOME/Notes}
+src=$dir/recurring.md
+today=${RECURRING_TODAY:-$(date +%F)}
+days=14
+dry=0
+heading='## Coming up'
+
+weekday_number() {
+    case ${1,,} in
+        sunday|sun|zondag|zo) echo 0 ;;
+        monday|mon|maandag|ma) echo 1 ;;
+        tuesday|tue|tues|dinsdag|di) echo 2 ;;
+        wednesday|wed|woensdag|wo) echo 3 ;;
+        thursday|thu|thur|thurs|donderdag|do) echo 4 ;;
+        friday|fri|vrijdag|vr) echo 5 ;;
+        saturday|sat|zaterdag|za) echo 6 ;;
+        *) return 1 ;;
+    esac
+}
+
+trim() {
+    local text=$1
+    text=${text#"${text%%[![:space:]]*}"}
+    text=${text%"${text##*[![:space:]]}"}
+    echo "$text"
+}
+
+last_day_of_month() { date -d "${1:0:7}-01 + 1 month - 1 day" +%d; }
+
+# is day $1 the Nth day of its month ("last", or a number: a shorter month uses its last day)?
+is_monthday() {
+    local day=$((10#${1:8:2})) last wanted=$2
+    last=$((10#$(last_day_of_month "$1")))
+    if [ "$wanted" = last ]; then
+        ((day == last))
+    else
+        ((wanted > last)) && wanted=$last
+        ((day == wanted))
+    fi
+}
+
+# does the rule (cadence word and argument) fall on day $3? status 2 when the rule itself is wrong
+matches() {
+    local word=$1 arg=$2 day=$3 dow
+    case $word in
+        daily) [ "$day" = "$today" ] ;;
+        weekly)
+            dow=$(weekday_number "$arg") || return 2
+            [ "$(date -d "$day" +%w)" = "$dow" ]
+            ;;
+        monthly | quarterly)
+            [[ $arg =~ ^([0-9]{1,2}|last)$ ]] || return 2
+            [ "$arg" = last ] || { ((10#$arg >= 1 && 10#$arg <= 31)) || return 2; }
+            if [ "$word" = quarterly ]; then
+                case ${day:5:2} in 01 | 04 | 07 | 10) ;; *) return 1 ;; esac
+            fi
+            is_monthday "$day" "$arg"
+            ;;
+        *) return 2 ;;
+    esac
+}
+
+# the text of an occurrence on day $2
+fill() {
+    local text=$1 day=$2
+    text=${text//YYYY-MM-DD/$day}
+    text=${text//YYYY-MM/${day:0:7}}
+    echo "$text"
+}
+
+# true when an occurrence is already somewhere in the notes, ticked or not
+exists() {
+    grep -rqF --include='*.md' -e "] $1 [[$2]]" "$dir"
+}
+
+append_line() {
+    if [ -s "$1" ] && [ -n "$(tail -c1 "$1")" ]; then
+        echo >> "$1"
+    fi
+    echo "$2" >> "$1"
+}
+
+# print the rules of the file, one per line as "word<TAB>arg<TAB>text", skipping code blocks; wrong lines go to stderr
+read_rules() {
+    local line fenced=0 re='^[[:space:]]*(daily|weekly|monthly|quarterly)([[:space:]]+[^|[:space:]]+)?[[:space:]]*\|(.*)$'
+    local n=0 bad=0 word arg text
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$((n + 1))
+        line=${line%$'\r'}
+        if [[ $line =~ ^[[:space:]]*\`\`\` ]]; then fenced=$((1 - fenced)); continue; fi
+        ((fenced)) && continue
+        if [[ $line =~ $re ]]; then
+            word=${BASH_REMATCH[1]}
+            arg=$(trim "${BASH_REMATCH[2]}")
+            text=$(trim "${BASH_REMATCH[3]}")
+            if [ -z "$text" ]; then
+                echo "recurring: line $n has no text: $line" >&2
+                bad=1
+                continue
+            fi
+            printf '%s\t%s\t%s\n' "$word" "${arg:--}" "$text"
+        elif [[ $line =~ ^[[:space:]]*(daily|weekly|monthly|quarterly)([[:space:]]|$) ]]; then
+            echo "recurring: line $n is not 'cadence | text': $line" >&2
+            bad=1
+        fi
+    done < "$src"
+    return $bad
+}
+
+main() {
+    local rules word arg text i day line added=0 status=0 out
+    [ -f "$src" ] || { echo "recurring: no $src" >&2; return 1; }
+    rules=$(read_rules) || status=1
+    while IFS=$'\t' read -r word arg text; do
+        [ -n "$word" ] || continue
+        [ "$arg" = - ] && arg=''
+        for ((i = 0; i < days; i++)); do
+            day=$(date -d "$today + $i days" +%F)
+            matches "$word" "$arg" "$day"
+            case $? in
+                0) ;;
+                1) continue ;;
+                *) echo "recurring: cannot read the rule: $word $arg | $text" >&2; status=1; break ;;
+            esac
+            line="- [ ] $(fill "$text" "$day") [[$day]]"
+            exists "$(fill "$text" "$day")" "$day" && continue
+            out+="$line"$'\n'
+        done
+    done <<< "$rules"
+
+    [ -n "$out" ] || return $status
+    if ((dry)); then
+        printf '%s' "$out"
+        return $status
+    fi
+    grep -qxF "$heading" "$src" || { [ -s "$src" ] && append_line "$src" ''; append_line "$src" "$heading"; append_line "$src" ''; }
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        append_line "$src" "$line"
+        echo "$line"
+        added=$((added + 1))
+    done <<< "$out"
+    return $status
+}
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        --days) days=$2; shift 2 ;;
+        --dry) dry=1; shift ;;
+        -h | --help) sed -n '2,/^dir=/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
+        *) echo "recurring: unknown option $1" >&2; exit 2 ;;
+    esac
+done
+[[ $days =~ ^[0-9]+$ ]] || { echo "recurring: --days needs a number" >&2; exit 2; }
+main
