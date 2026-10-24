@@ -1,10 +1,17 @@
 #!/bin/bash
-# quick-note: capture a line into today's note (~/Notes/YYYY-MM-DD.md, the daily note telekasten opens)
-# without leaving what you are doing. It is added as a todo ("- [ ] text"); start the text with "n:"
-# for a plain bullet instead ("- text").
-# NOTES_DIR overrides the folder; `quick-note --add TEXT` skips the prompt.
+# quick-note: capture a line without leaving what you are doing. It is added as a todo ("- [ ] text") to today's
+# note (~/Notes/daily/YYYY-MM-DD.md, the daily note telekasten opens), or, written as "name: text", to the note
+# called name (it must exist), right after that note's last todo.
+# In the text, @friday, @vrijdag, @morgen, @+3d, @+2w, @+1m and @2026-10-30 become the date link [[YYYY-MM-DD]]
+# (telekasten has no relative dates); that link is the deadline the start page shows.
+# Start the text with "n:" for a plain bullet in today's note instead ("- text").
+# These are the rules of the start page (the homepage repo, public/lib.js, parseCapture); a test there runs both
+# and compares what they write.
+# NOTES_DIR overrides the folder, QUICK_NOTE_TODAY=YYYY-MM-DD fixes "today" (for tests);
+# `quick-note --add TEXT` skips the prompt.
 dir=${NOTES_DIR:-$HOME/Notes}
-file="$dir/$(date +%F).md"
+today=${QUICK_NOTE_TODAY:-$(date +%F)}
+file="$dir/daily/$today.md"
 
 trim() {
     local text=$1
@@ -13,9 +20,145 @@ trim() {
     echo "$text"
 }
 
-# add TEXT: append it to today's note and print the line that was written
+# ---- dates: @friday and friends -> the day they mean ----------------------------------------------
+
+add_days() { date -d "$1 + $2 days" +%F; }
+
+# the same day of the month, or the last day of a shorter month (31 Jan + 1 month = 28 Feb)
+add_months() {
+    local year=${1:0:4} month=$((10#${1:5:2})) day=$((10#${1:8:2})) n=$2 total ny nm last
+    total=$((10#$year * 12 + month - 1 + n))
+    ny=$((total / 12))
+    nm=$((total % 12 + 1))
+    last=$(date -d "$(printf '%04d-%02d-01' "$ny" "$nm") + 1 month - 1 day" +%d)
+    ((day > 10#$last)) && day=$((10#$last))
+    printf '%04d-%02d-%02d\n' "$ny" "$nm" "$day"
+}
+
+weekday_number() {
+    case $1 in
+        sunday|sun|zondag|zo) echo 0 ;;
+        monday|mon|maandag|ma) echo 1 ;;
+        tuesday|tue|tues|dinsdag|di) echo 2 ;;
+        wednesday|wed|woensdag|wo) echo 3 ;;
+        thursday|thu|thur|thurs|donderdag|do) echo 4 ;;
+        friday|fri|vrijdag|vr) echo 5 ;;
+        saturday|sat|zaterdag|za) echo 6 ;;
+        *) return 1 ;;
+    esac
+}
+
+# a date word -> YYYY-MM-DD, or fail. A weekday is the next one after today (on a Saturday, "saturday" is a week away).
+resolve_word() {
+    local word=${1,,} n dow delta
+    case $word in
+        today|vandaag) echo "$today"; return 0 ;;
+        tomorrow|morgen) add_days "$today" 1; return 0 ;;
+        overmorgen) add_days "$today" 2; return 0 ;;
+    esac
+    if dow=$(weekday_number "$word"); then
+        delta=$(((dow - $(date -d "$today" +%w) + 7) % 7))
+        ((delta == 0)) && delta=7
+        add_days "$today" "$delta"
+        return 0
+    fi
+    if [[ $word =~ ^\+([0-9]{1,3})([dwm])$ ]]; then
+        n=$((10#${BASH_REMATCH[1]}))
+        case ${BASH_REMATCH[2]} in
+            d) add_days "$today" "$n" ;;
+            w) add_days "$today" $((7 * n)) ;;
+            m) add_months "$today" "$n" ;;
+        esac
+        return 0
+    fi
+    if [[ $word =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [ "$(date -d "$word" +%F 2>/dev/null)" = "$word" ]; then
+        echo "$word"
+        return 0
+    fi
+    return 1
+}
+
+# every @date in a stretch of text without `code` becomes [[date]]; other @words (@home) and e-mail addresses stay
+resolve_plain() {
+    local rest=$1 out='' re='(^|[[:space:](])@([[:alnum:]+-]+)([[:space:].,;:!?)]|$)' match lead word after before iso
+    while [[ $rest =~ $re ]]; do
+        match=${BASH_REMATCH[0]} lead=${BASH_REMATCH[1]} word=${BASH_REMATCH[2]} after=${BASH_REMATCH[3]}
+        before=${rest%%"$match"*}
+        if iso=$(resolve_word "$word"); then
+            out+="$before$lead[[$iso]]$after"
+        else
+            out+="$before$match"
+        fi
+        rest=${rest#*"$match"}
+    done
+    printf '%s%s' "$out" "$rest"
+}
+
+# the same, but text between backticks is left exactly as it is
+resolve_dates() {
+    local rest=$1 out='' code='^([^`]*)(`[^`]*`)(.*)$' plain
+    while [[ $rest =~ $code ]]; do
+        plain=${BASH_REMATCH[1]}
+        out+=$(resolve_plain "$plain")${BASH_REMATCH[2]}
+        rest=${BASH_REMATCH[3]}
+    done
+    out+=$(resolve_plain "$rest")
+    printf '%s' "$out"
+}
+
+# ---- notes ----------------------------------------------------------------------------------------
+
+# the name of the existing note called $1 (any case): a real .md file in the notes folder, not named like a date
+find_note() {
+    local wanted=${1,,} f name root
+    root=$(realpath "$dir")
+    for f in "$dir"/*.md; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f" .md)
+        [[ $name =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && continue
+        [ "${name,,}" = "$wanted" ] || continue
+        # a symlink that points somewhere else is not a note
+        [ "$(dirname "$(realpath "$f")")" = "$root" ] || continue
+        echo "$name"
+        return 0
+    done
+    return 1
+}
+
+# append a line to a file, without gluing it onto a last line that has no trailing newline
+append_line() {
+    if [ -s "$1" ] && [ -n "$(tail -c1 "$1")" ]; then
+        echo >> "$1"
+    fi
+    echo "$2" >> "$1"
+}
+
+# put a line right after the last todo in a note (so it lands with the others, not after the links at the bottom),
+# or at the end when the note has no todos. CRLF endings and the file mode are kept; the note is replaced in one step.
+insert_after_last_todo() {
+    local note=$1 line=$2 last tmp
+    last=$(gawk '/^[ \t]*- \[[ xX]\] /{n=NR} END{print n+0}' "$note")
+    if ((last == 0)); then
+        append_line "$note" "$line"
+        return
+    fi
+    if sed -n "${last}p" "$note" | grep -q $'\r$'; then
+        line+=$'\r'
+    fi
+    tmp=$(mktemp "$dir/.quick-note.XXXXXX") || return 1
+    if LINE=$line gawk -v n="$last" '
+            { printf "%s%s", $0, RT }
+            NR == n { if (RT == "") printf "\n%s", ENVIRON["LINE"]; else printf "%s\n", ENVIRON["LINE"] }
+        ' "$note" > "$tmp" && chmod --reference="$note" "$tmp" && mv "$tmp" "$note"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+# add TEXT: write it where it belongs and print "where<US>line", where is the note it went to
 add() {
-    local text line
+    local text line project='' wanted rest re='^([^:]+):[[:space:]]+([^[:space:]].*)$'
     text=$(trim "$1")
     [ -n "$text" ] || return 1
 
@@ -24,23 +167,40 @@ add() {
         text=${text#"${text%%[![:space:]]*}"}
         line="- $text"
     else
-        line="- [ ] $text"
+        if [[ $text =~ $re ]]; then
+            wanted=$(trim "${BASH_REMATCH[1]}")
+            rest=${BASH_REMATCH[2]}
+            if project=$(find_note "$wanted"); then
+                text=$(trim "$rest")
+            else
+                project=''
+            fi
+        fi
+        line="- [ ] $(resolve_dates "$text")"
     fi
 
-    mkdir -p "$dir"
-    # do not glue the new line onto a last line that has no trailing newline
-    if [ -s "$file" ] && [ -n "$(tail -c1 "$file")" ]; then
-        echo >> "$file"
+    if [ -n "$project" ]; then
+        insert_after_last_todo "$dir/$project.md" "$line" || return 1
+        printf '%s\x1f%s' "$project" "$line"
+    else
+        mkdir -p "$dir/daily"
+        append_line "$file" "$line"
+        printf '%s\x1f%s' "today" "$line"
     fi
-    echo "$line" >> "$file"
-    echo "$line"
 }
 
 if [ "$1" = --add ]; then
-    add "$2"
+    out=$(add "$2") || exit 1
+    echo "${out#*$'\x1f'}"
     exit
 fi
 
 input=$(fuzzel --dmenu --prompt-only '󰎞 ' --width 60) || exit 0
-line=$(add "$input") || exit 0
-notify-send -a notes -t 2000 "Noted" "${line#- }"
+out=$(add "$input") || exit 0
+where=${out%%$'\x1f'*}
+line=${out#*$'\x1f'}
+if [ "$where" = today ]; then
+    notify-send -a notes -t 2000 "Noted" "${line#- }"
+else
+    notify-send -a notes -t 2000 "Noted in $where" "${line#- }"
+fi
