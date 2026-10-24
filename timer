@@ -1,0 +1,86 @@
+#!/bin/bash
+# timer: a countdown that shows in the status bar and sends a notification when it ends.
+#
+#   timer 25m [LABEL]   start (a bare number is minutes; 90s, 1h30m, 2m30s work too); replaces a running one
+#   timer               how long is left
+#   timer stop          cancel it
+#
+# State is in $XDG_RUNTIME_DIR/timer: the end time (epoch seconds), a tab and the label. A user systemd timer
+# (unit timer-ding) sends the notification, so it survives closing the terminal.
+
+state="${XDG_RUNTIME_DIR:-/tmp}/timer"
+unit=timer-ding
+
+# seconds TEXT: the number of seconds in 25m, 1h30m, 90s or a bare number of minutes -> $REPLY; fails on anything else
+seconds() {
+    local rest=$1 n unit total=0
+    if [[ $rest =~ ^[0-9]+$ ]]; then
+        REPLY=$((rest * 60))
+        return 0
+    fi
+    [[ $rest =~ ^([0-9]+[hms])+$ ]] || return 1
+    while [[ $rest =~ ^([0-9]+)([hms])(.*)$ ]]; do
+        n=${BASH_REMATCH[1]} unit=${BASH_REMATCH[2]} rest=${BASH_REMATCH[3]}
+        case $unit in
+            h) total=$((total + n * 3600)) ;;
+            m) total=$((total + n * 60)) ;;
+            s) total=$((total + n)) ;;
+        esac
+    done
+    REPLY=$total
+}
+
+# clock SECONDS: 1:30:05 or 4:09
+clock() {
+    if [ "$1" -ge 3600 ]; then
+        printf '%d:%02d:%02d' $(($1 / 3600)) $(($1 % 3600 / 60)) $(($1 % 60))
+    else
+        printf '%d:%02d' $(($1 / 60)) $(($1 % 60))
+    fi
+}
+
+stop_timer() {
+    systemctl --user stop "$unit.timer" "$unit.service" 2>/dev/null
+    rm -f "$state"
+}
+
+refresh_bar() { "$(dirname "$(readlink -f "$0")")/statusbar-refresh"; }
+
+start() {
+    local label=${2:-timer} end
+    seconds "$1" || { echo "timer: cannot read '$1' as a time (25m, 1h30m, 90s)" >&2; exit 1; }
+    if [ "$REPLY" -le 0 ]; then
+        echo "timer: that is no time at all" >&2
+        exit 1
+    fi
+    stop_timer
+    end=$(($(date +%s) + REPLY))
+    printf '%s\t%s\n' "$end" "$label" > "$state"
+    systemd-run --user --quiet --unit="$unit" --on-active="$REPLY" \
+        bash -c 'notify-send -a timer -u critical -i alarm-symbolic "Time is up" "$1"; rm -f "$2"' _ "$label" "$state"
+    echo "timer: $label, $(clock "$REPLY") from now"
+    refresh_bar
+}
+
+show() {
+    local end label left
+    if [ ! -f "$state" ]; then
+        echo "no timer is running"
+        return 0
+    fi
+    IFS=$'\t' read -r end label < "$state"
+    left=$((end - $(date +%s)))
+    if [ "$left" -le 0 ]; then
+        rm -f "$state"
+        echo "no timer is running"
+        return 0
+    fi
+    echo "$label: $(clock "$left") left"
+}
+
+case ${1:-} in
+    "")           show ;;
+    stop|cancel)  stop_timer; refresh_bar; echo "timer stopped" ;;
+    -h|--help)    sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *)            start "$@" ;;
+esac

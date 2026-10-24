@@ -4,8 +4,9 @@
 # Modules that only matter sometimes stay hidden until they do:
 #   - REC while recording, a presentation icon in presentation mode, do-not-disturb
 #   - the microphone, the camera or a screen share, while one of them is in use (see `privacy-status`)
+#   - the countdown of `timer`, and the number of packages dnf can upgrade (checked hourly)
 #   - the playing track
-#   - cpu, ram and disk when high; battery when low
+#   - cpu, ram and disk when high, the temperature when warm (the hottest of cpu, gpu and ssd); battery when low
 #   - brightness and volume for a few seconds after a change
 #   - a power profile icon, unless it is balanced
 #   - Azure DevOps: pull requests waiting for you and failed runs of yours (see `ado`)
@@ -21,7 +22,11 @@
 : "${SHOW_CHANGE:=3}"    # seconds to show brightness/volume after they change
 : "${CPU_HIGH:=80}"      # percent
 : "${MEM_HIGH:=85}"      # percent
+: "${TEMP_HIGH:=75}"     # degrees Celsius, the hottest sensor: shown from here, orange
+: "${TEMP_HOT:=90}"      # degrees Celsius: red
 : "${DISK_HIGH:=85}"     # percent used on /
+: "${UPDATES_MIN:=1}"      # packages to upgrade before the count is shown
+: "${UPDATES_EVERY:=3600}" # seconds between the checks for updates
 : "${BAT_LOW:=20}"       # percent
 : "${NET_MIN:=50}"       # KiB/s, down or up
 : "${MEDIA_MAX:=40}"     # characters of "artist - title" to show
@@ -57,6 +62,8 @@ paint() { printf -v res '<span foreground="%s">%s</span>' "$1" "$2"; }
 
 showall_file="${XDG_RUNTIME_DIR:-/tmp}/statusbar.showall"   # holds the epoch time to stop showing everything
 pidfile="${XDG_RUNTIME_DIR:-/tmp}/statusbar.pid"
+timer_file="${XDG_RUNTIME_DIR:-/tmp}/timer"                 # written by `timer`: end time, a tab and the label
+updates_file="${XDG_RUNTIME_DIR:-/tmp}/statusbar.updates"  # the count of upgradable packages, from the last check
 
 poke=0
 trap 'poke=1' USR1    # remembered, so a signal during a redraw is not lost
@@ -184,6 +191,73 @@ cpu() {
     fi
 }
 
+# the hottest of the processor, the graphics chip and the SSD, in whole degrees -> $REPLY (empty when none can be read)
+hottest() {
+    local dir name value
+    REPLY=""
+    for dir in /sys/class/hwmon/hwmon*; do
+        read -r name < "$dir/name" 2>/dev/null || continue
+        case $name in
+            k10temp|coretemp|amdgpu|nvme) ;;
+            *) continue ;;
+        esac
+        read -r value < "$dir/temp1_input" 2>/dev/null || continue
+        value=$((value / 1000))
+        if [ -z "$REPLY" ] || [ "$value" -gt "$REPLY" ]; then REPLY=$value; fi
+    done
+}
+
+temp() {
+    local color
+    hottest
+    [ -n "$REPLY" ] || return
+
+    if [ "$all" = 1 ] || [ "$REPLY" -ge "$TEMP_HIGH" ]; then
+        color=$ORANGE
+        [ "$REPLY" -ge "$TEMP_HOT" ] && color=$RED
+        paint "$color" "󰔏 $REPLY°"
+    fi
+}
+
+# the countdown of `timer`, while one runs; red in the last minute
+timer() {
+    local end label left color
+    [ -f "$timer_file" ] || return
+    IFS=$'\t' read -r end label < "$timer_file"
+    left=$((end - $(date +%s)))
+    [ "$left" -gt 0 ] || return
+    color=$YELLOW
+    [ "$left" -le 60 ] && color=$RED
+    if [ "$left" -ge 3600 ]; then
+        printf -v left '%d:%02d:%02d' $((left / 3600)) $((left % 3600 / 60)) $((left % 60))
+    else
+        printf -v left '%d:%02d' $((left / 60)) $((left % 60))
+    fi
+    esc "$label"
+    if [ "$REPLY" = timer ]; then paint "$color" "󱎫 $left"; else paint "$color" "󱎫 $left $REPLY"; fi
+}
+
+# the number of packages dnf can upgrade, from a check that runs in the background at most every UPDATES_EVERY seconds
+# (dnf takes a second or two and may need the network, so the bar only reads the answer of the last check)
+updates() {
+    local now count age=-1
+    now=$(date +%s)
+    if [ -f "$updates_file" ]; then age=$((now - $(stat -c %Y "$updates_file"))); fi
+    # an empty file is a check that has not finished (or was killed, by a reload of the bar): try again after 2 minutes
+    if [ "$age" -lt 0 ] || [ "$age" -ge "$UPDATES_EVERY" ] || { [ ! -s "$updates_file" ] && [ "$age" -ge 120 ]; }; then
+        touch "$updates_file"    # so that a slow check is not started twice
+        (dnf -q check-upgrade 2>/dev/null | awk '/^Upgrades/ {on = 1; next} on && NF == 0 {exit} on {n++} END {print n + 0}' \
+            > "$updates_file.new" && mv "$updates_file.new" "$updates_file") >/dev/null 2>&1 &
+        disown
+    fi
+    read -r count < "$updates_file" 2>/dev/null
+    [[ $count =~ ^[0-9]+$ ]] || return
+
+    if [ "$all" = 1 ] || [ "$count" -ge "$UPDATES_MIN" ]; then
+        paint "$BLUE" "󰚰 $count"
+    fi
+}
+
 mem() {
     local percent color
     percent=$(awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {printf "%d", 100 * (t - a) / t}' /proc/meminfo)
@@ -256,7 +330,7 @@ profile() {
     case $active in
         power-saver) paint "$GREEN" "󰌪" ;;
         performance) paint "$ORANGE" "󰓅" ;;
-        balanced)    [ "$all" = 1 ] && paint "$DIM" "󰾅" ;;
+        balanced)    [ "$all" = 1 ] && paint "$DIM" "󰗑" ;;
     esac
 }
 
@@ -397,7 +471,7 @@ read_show_all() {
 # prints the whole status line: the modules that have something to show, then the clock
 draw() {
     local parts=() module line part
-    for module in rec privacy pres cpu mem disk net brightness bluetooth wifi volume dnd profile battery devops media; do
+    for module in rec privacy pres timer cpu temp mem disk net brightness bluetooth wifi volume dnd profile battery devops updates media; do
         res=""
         $module
         [ -n "$res" ] && parts+=("$res")
@@ -418,7 +492,7 @@ draw() {
 refresh_delay() {
     local now
     now=$(date +%s)
-    if [ "$all" = 1 ] || [ "$now" -lt "$bright_until" ] || [ "$now" -lt "$vol_until" ]; then
+    if [ "$all" = 1 ] || [ "$now" -lt "$bright_until" ] || [ "$now" -lt "$vol_until" ] || [ -f "$timer_file" ]; then
         echo 1
     else
         echo "$IDLE"
